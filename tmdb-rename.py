@@ -301,6 +301,43 @@ def choose_title(
     return loc_title or result.get("title", original)
 
 
+# ─── Titel-Vergleich ─────────────────────────────────────────────────────────
+
+_SUPERSCRIPT_TRANS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
+
+
+def _norm_title_cmp(s: str) -> str:
+    """Normalisiert Titel für unscharfen Vergleich.
+    Superscript→ASCII-Ziffern, Separatoren→Leerzeichen, Kleinschreibung."""
+    s = s.translate(_SUPERSCRIPT_TRANS)
+    s = re.sub(r"[.\-–—_]+", " ", s)
+    return re.sub(r"\s+", " ", s).lower().strip()
+
+
+def titles_similar(a: str, b: str) -> bool:
+    """
+    True wenn zwei Titel inhaltlich gleich gelten:
+    - Exakt (nach Normalisierung)
+    - Ohne Whitespace identisch (z.B. "Accountant²" ≡ "Accountant 2")
+    - Präfix-Beziehung: einer beginnt mit dem anderen, gefolgt von Leerzeichen
+      oder Trenner (z.B. "Together" ⊂ "Together - Unzertrennlich",
+      "The Toxic Avenger" ⊂ "The Toxic Avenger Unrated")
+    """
+    an, bn = _norm_title_cmp(a), _norm_title_cmp(b)
+    if an == bn:
+        return True
+    # Ohne Whitespace (für Superscript-/Zahlenvarianten)
+    if re.sub(r"\s+", "", an) == re.sub(r"\s+", "", bn):
+        return True
+    # Präfix-Check
+    for shorter, longer in ((an, bn), (bn, an)):
+        if longer.startswith(shorter):
+            rest = longer[len(shorter):]
+            if not rest or rest[0] in " \t-–:":
+                return True
+    return False
+
+
 # ─── Dateiname-Parsing ────────────────────────────────────────────────────────
 
 def parse_scene_filename(filename: str) -> tuple[str, str | None]:
@@ -371,6 +408,13 @@ def apply_format(
       {lang}           original_language-Code (z.B. "de", "en")
       {original_title} Unberührter original_title aus TMDB
       {title_XX}       Lokalisierter Titel für Locale XX (auto-erkannt)
+
+    Optional-Blöcke:
+      Teile des Templates in [...] werden weggelassen, wenn alle enthaltenen
+      {title_XX}-Werte dem Primärtitel entsprechen oder leer sind.
+      Beispiel: "{title}{sep}({year})[-{title_de}]"
+        de == primär  → "The.Movie.(2024)"
+        de != primär  → "The.Movie.(2024)-Das.Film"
     """
     def title_val(s: str) -> str:
         """Bereinigt Titelwert und ersetzt interne Leerzeichen durch sep."""
@@ -383,11 +427,40 @@ def apply_format(
             s = s.strip()
         return s
 
-    result = fmt
+    primary = title_val(title)
+
+    # Optional-Blöcke [...] auswerten:
+    # Enthält ein Block nur {title_XX}, die dem Primärtitel entsprechen oder leer sind,
+    # wird der gesamte Block weggelassen. Andernfalls wird der Block-Inhalt übernommen.
+    def resolve_optional_block(m: re.Match) -> str:
+        content = m.group(1)
+        codes = re.findall(r"\{title_([a-zA-Z_-]+)\}", content)
+        if not codes:
+            return content  # kein lokalisierter Platzhalter → immer einschließen
+        for code in codes:
+            loc_raw = (extra_titles or {}).get(code, "")
+            if loc_raw and not titles_similar(title, loc_raw):
+                # Mindestens einer weicht inhaltlich ab → Block einschließen und rendern
+                rendered = content
+                rendered = rendered.replace("{sep}", sep)
+                rendered = rendered.replace("{title}", primary)
+                rendered = rendered.replace("{year}", year)
+                rendered = rendered.replace("{lang}", lang)
+                rendered = rendered.replace("{original_title}", title_val(original_title))
+                if extra_titles:
+                    for c, t in extra_titles.items():
+                        rendered = rendered.replace(f"{{title_{c}}}", title_val(t))
+                rendered = re.sub(r"\{title_[a-zA-Z_-]+\}", primary, rendered)
+                return rendered
+        # Alle gleich oder leer → Block weglassen
+        return ""
+
+    result = re.sub(r"\[([^\[\]]*)\]", resolve_optional_block, fmt)
+
     # {sep} zuerst ersetzen (Struktur-Platzhalter, kein Titelwert)
     result = result.replace("{sep}", sep)
     # Titelwerte einsetzen (sep gilt nur innerhalb)
-    result = result.replace("{title}",          title_val(title))
+    result = result.replace("{title}",          primary)
     result = result.replace("{year}",           year)
     result = result.replace("{lang}",           lang)
     result = result.replace("{original_title}", title_val(original_title))
@@ -397,7 +470,7 @@ def apply_format(
             result = result.replace(f"{{title_{code}}}", title_val(loc_title))
 
     # Unbekannte {title_XX}-Platzhalter → Primärtitel als Fallback
-    result = re.sub(r"\{title_[a-zA-Z_-]+\}", title_val(title), result)
+    result = re.sub(r"\{title_[a-zA-Z_-]+\}", primary, result)
 
     # Illegale Dateiname-Zeichen aus Template-Struktur entfernen
     result = re.sub(r'[<>:"/\\|?*\x00]', "", result)
