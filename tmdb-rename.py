@@ -308,9 +308,9 @@ _SUPERSCRIPT_TRANS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
 
 def _norm_title_cmp(s: str) -> str:
     """Normalisiert Titel für unscharfen Vergleich.
-    Superscript→ASCII-Ziffern, Separatoren→Leerzeichen, Kleinschreibung."""
+    Superscript→ASCII-Ziffern, Separatoren+Satzzeichen→Leerzeichen, Kleinschreibung."""
     s = s.translate(_SUPERSCRIPT_TRANS)
-    s = re.sub(r"[.\-–—_]+", " ", s)
+    s = re.sub(r"[.\-–—_:,!?'\"]+", " ", s)
     return re.sub(r"\s+", " ", s).lower().strip()
 
 
