@@ -12,6 +12,9 @@ Verwendung:
   python3 tmdb-rename.py /quelle --execute /ziel                           # nach /ziel verschieben
   python3 tmdb-rename.py /quelle --live                                    # fehlgeschlagene interaktiv nachbearbeiten
   python3 tmdb-rename.py /quelle --keep-original-title en,de               # Original-Titel für EN/DE-Filme erzwingen
+  python3 tmdb-rename.py /quelle --keep-original-title latin               # Original-Titel für alle lateinischsprachigen Filme
+  python3 tmdb-rename.py /quelle --keep-original-title latin,ja            # Latin + Japanisch
+  python3 tmdb-rename.py /quelle --force-ffprobe                           # MKV-Titel als primäre Suchquelle
   python3 tmdb-rename.py /quelle --locale de-DE                            # TMDB-Suchergebnisse auf Deutsch
   python3 tmdb-rename.py /quelle --format "{title_de}{sep}{title_en}{sep}({year})"  # Zweisprachig
   python3 tmdb-rename.py /quelle --undo backup.json                        # Dry-Run Undo
@@ -37,8 +40,10 @@ import re
 import sys
 import time
 import json
+import shutil
 import argparse
 import datetime
+import subprocess
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode
 from urllib.error import HTTPError, URLError
@@ -269,7 +274,9 @@ def choose_title(
     """
     Wählt den besten Primärtitel für den Dateinamen.
 
-    keep_original_langs (z.B. {"en", "de"}):
+    keep_original_langs (z.B. {"en", "de"} oder {"latin"}):
+      - "latin" in der Menge → original_title erzwungen für alle Sprachen mit
+        lateinischem Schriftsystem (Script-Check statt Sprachcode-Vergleich)
       - original_language in der Menge → original_title erzwungen
         (Fallback auf locale/Englisch wenn nicht-lateinisch)
       - original_language NICHT in der Menge → TMDB-Titel aus Suchergebnis
@@ -283,7 +290,12 @@ def choose_title(
     fallback_locale = locale or "en-US"
 
     if keep_original_langs is not None:
-        if orig_lang in keep_original_langs:
+        # "latin"-Keyword: Original-Titel für alle Sprachen mit lateinischem Schrift
+        in_set = orig_lang in keep_original_langs
+        if not in_set and "latin" in keep_original_langs:
+            in_set = is_latin_script(original)
+
+        if in_set:
             # Original-Sprache gewünscht: original_title bevorzugen
             if is_latin_script(original):
                 return original
@@ -305,13 +317,36 @@ def choose_title(
 
 _SUPERSCRIPT_TRANS = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹", "0123456789")
 
+# Zahlwörter (EN/DE/FR/ES/IT) → Ziffern für sprachübergreifenden Titelvergleich
+_NUM_WORDS: dict[str, str] = {
+    "one": "1",   "eins": "1",  "une": "1",   "uno": "1",   "una": "1",
+    "two": "2",   "zwei": "2",  "deux": "2",  "dos": "2",   "due": "2",
+    "three": "3", "drei": "3",  "trois": "3", "tres": "3",  "tre": "3",
+    "four": "4",  "vier": "4",  "quatre": "4","cuatro": "4","quattro": "4",
+    "five": "5",  "funf": "5",  "cinq": "5",  "cinco": "5", "cinque": "5",
+    "six": "6",   "sechs": "6", "six": "6",   "seis": "6",  "sei": "6",
+    "seven": "7", "sieben": "7","sept": "7",  "siete": "7", "sette": "7",
+    "eight": "8", "acht": "8",  "huit": "8",  "ocho": "8",  "otto": "8",
+    "nine": "9",  "neun": "9",  "neuf": "9",  "nueve": "9", "nove": "9",
+    "ten": "10",  "zehn": "10", "dix": "10",  "diez": "10", "dieci": "10",
+}
+
+# "Teil", "Partie" usw. → "part" für sprachübergreifenden Vergleich
+_PART_SYNONYMS: frozenset[str] = frozenset({
+    "teil", "partie", "parte", "kapitel", "chapter",
+})
+
 
 def _norm_title_cmp(s: str) -> str:
     """Normalisiert Titel für unscharfen Vergleich.
-    Superscript→ASCII-Ziffern, Separatoren+Satzzeichen→Leerzeichen, Kleinschreibung."""
+    Superscript→ASCII-Ziffern, Separatoren+Satzzeichen→Leerzeichen,
+    Zahlwörter→Ziffern, Part-Synonyme→'part', Kleinschreibung."""
     s = s.translate(_SUPERSCRIPT_TRANS)
     s = re.sub(r"[.\-–—_:,!?'\"]+", " ", s)
-    return re.sub(r"\s+", " ", s).lower().strip()
+    s = re.sub(r"\s+", " ", s).lower().strip()
+    words = [_NUM_WORDS.get(w, w) for w in s.split()]
+    words = ["part" if w in _PART_SYNONYMS else w for w in words]
+    return " ".join(words)
 
 
 def titles_similar(a: str, b: str) -> bool:
@@ -339,6 +374,41 @@ def titles_similar(a: str, b: str) -> bool:
 
 
 # ─── Dateiname-Parsing ────────────────────────────────────────────────────────
+
+# ─── ffprobe ──────────────────────────────────────────────────────────────────
+
+_FFPROBE_PATH: str | None = shutil.which("ffprobe")  # None wenn nicht installiert
+
+
+def get_mkv_title(filepath: str) -> str | None:
+    """
+    Liest den TITLE-Tag aus dem MKV-Container via ffprobe.
+    Gibt None zurück wenn: ffprobe nicht installiert, kein Tag, Fehler.
+    """
+    if not _FFPROBE_PATH:
+        return None
+    try:
+        out = subprocess.check_output(
+            [
+                _FFPROBE_PATH, "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                filepath,
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+        )
+        data = json.loads(out)
+        title = data.get("format", {}).get("tags", {}).get("title", "")
+        # Auch Großschreibung prüfen
+        if not title:
+            tags = {k.lower(): v for k, v in data.get("format", {}).get("tags", {}).items()}
+            title = tags.get("title", "")
+        return title.strip() or None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            json.JSONDecodeError, OSError):
+        return None
+
 
 def parse_scene_filename(filename: str) -> tuple[str, str | None]:
     """
@@ -380,7 +450,7 @@ def sanitize_for_filename(name: str) -> str:
     return name
 
 
-DEFAULT_FORMAT = "{title}{sep}({year})"
+DEFAULT_FORMAT = "{title}{sep}({year})[{sep}-{sep}{title_de}]"
 
 
 def apply_format(
@@ -792,9 +862,12 @@ def main() -> None:
     parser.add_argument(
         "--keep-original-title",
         metavar="LANGS",
-        default="de,en",
-        help="Komma-separierte ISO-639-1-Codes (z.B. 'en,de'). "
-             "Filme dieser Originalsprachen werden mit ihrem TMDB-Originaltitel benannt. "
+        default="latin",
+        help="Komma-separierte ISO-639-1-Codes (z.B. 'en,de') und/oder das Keyword 'latin'. "
+             "'latin' → Original-Titel für alle Sprachen mit lateinischem Schriftsystem "
+             "(deckt z.B. es, fr, it, pt, pl, nl, … auf einmal ab). "
+             "ISO-Codes → Original-Titel nur für diese Sprachen. "
+             "Kombinierbar, z.B. 'latin,ja'. "
              "Alle anderen Sprachen erhalten den TMDB-Standardtitel (Englisch). "
              "Ohne Flag: bisheriges Verhalten (Latin-Script → Originaltitel, sonst Englisch).",
     )
@@ -822,6 +895,13 @@ def main() -> None:
         help="Pause zwischen API-Anfragen in Sekunden (Standard: 0.3)",
     )
     parser.add_argument(
+        "--force-ffprobe",
+        action="store_true",
+        help="MKV-Metadaten-Titel (TITLE-Tag) als primäre Suchquelle verwenden statt "
+             "als Fallback. ffprobe muss installiert sein. Ohne Flag: ffprobe wird nur "
+             "genutzt, wenn die normale Suche keinen Treffer liefert.",
+    )
+    parser.add_argument(
         "--skip-found",
         action="store_true",
         help="Dateien überspringen, die schon im Format 'Titel(Jahr).ext' sind",
@@ -832,6 +912,11 @@ def main() -> None:
         help="Umbenennung rückgängig machen anhand einer Backup-JSON-Datei",
     )
     args = parser.parse_args()
+
+    # ── --force-ffprobe prüfen ─────────────────────────────────────────────
+    if args.force_ffprobe and not _FFPROBE_PATH:
+        print("⚠ --force-ffprobe: ffprobe nicht gefunden — Suche läuft normal über Dateinamen.")
+        print("  ffprobe installieren: sudo pacman -S ffmpeg  (oder apt install ffmpeg)")
 
     # ── keep-original-title parsen ──────────────────────────────────────────
     keep_original_langs: set[str] | None = None
@@ -947,11 +1032,18 @@ def main() -> None:
         original_title_raw: str = ""
         cached = cache.get(filename)
         if cached:
-            chosen             = cached["chosen_title"]
             tmdb_year          = (cached.get("release_date") or "")[:4] or parsed_year or "????"
             result_id          = cached.get("id", "cache")
             orig_lang          = cached.get("original_language", "")
             original_title_raw = cached.get("original_title", "")
+            # chosen_title immer neu ableiten (reagiert auf --keep-original-title-Änderungen)
+            cached_result_stub = {
+                "id":                result_id,
+                "original_title":    original_title_raw,
+                "original_language": orig_lang,
+                "title":             cached.get("title", ""),
+            }
+            chosen = choose_title(cached_result_stub, api_key, keep_original_langs, locale=locale)
             # Lokalisierte Zusatztitel aus Cache laden / fehlende nachholen
             if lang_locales:
                 cached_locs = dict(cached.get("localized_titles") or {})
@@ -964,9 +1056,39 @@ def main() -> None:
                 extra_titles = cached_locs
         elif api_key:
             # ── TMDB-Suche ────────────────────────────────────────────────────
+            filepath = os.path.join(directory, filename)
+            mkv_title: str | None = None
+            if ext == ".mkv":
+                mkv_title = get_mkv_title(filepath)
+
+            # Suchreihenfolge je nach --force-ffprobe:
+            # Mit Flag + MKV-Titel: nur ffprobe-Titel, kein Dateiname-Fallback
+            # Mit Flag, aber kein MKV-Titel (ffprobe leer/nicht da): normale Suche
+            if args.force_ffprobe and mkv_title:
+                search_queries = [(mkv_title, None)]
+            else:
+                search_queries = [(parsed_title, parsed_year), (parsed_title, None)]
+
+            result = None
+            used_query = parsed_title
             try:
-                result, _ = tmdb_search(parsed_title, parsed_year, api_key, locale=locale)
-                time.sleep(args.delay)
+                for sq, sy in search_queries:
+                    if not sq:
+                        continue
+                    result, used_query = tmdb_search(sq, sy, api_key, locale=locale)
+                    time.sleep(args.delay)
+                    if result:
+                        break
+
+                # Fallback: ffprobe (nur wenn nicht --force-ffprobe, da dort schon drin)
+                if not result and not args.force_ffprobe and ext == ".mkv":
+                    if mkv_title:
+                        result, used_query = tmdb_search(mkv_title, None, api_key, locale=locale)
+                        time.sleep(args.delay)
+                    elif not _FFPROBE_PATH:
+                        # ffprobe wäre hilfreich gewesen, ist aber nicht da
+                        print(f"\n  ℹ {filename}")
+                        print( "    Tipp: ffprobe installieren (ffmpeg-Paket) für MKV-Metadaten-Fallback")
             except RuntimeError as e:
                 failed.append((filename, f"API-Fehler: {e}"))
                 errors += 1
