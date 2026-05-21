@@ -10,7 +10,6 @@ Verwendung:
   python3 tmdb-rename.py /quelle                                           # Dry-Run
   python3 tmdb-rename.py /quelle --execute                                 # in-place umbenennen
   python3 tmdb-rename.py /quelle --execute /ziel                           # nach /ziel verschieben
-  python3 tmdb-rename.py /quelle --live                                    # fehlgeschlagene interaktiv nachbearbeiten
   python3 tmdb-rename.py /quelle --keep-original-title en,de               # Original-Titel für EN/DE-Filme erzwingen
   python3 tmdb-rename.py /quelle --keep-original-title latin               # Original-Titel für alle lateinischsprachigen Filme
   python3 tmdb-rename.py /quelle --keep-original-title latin,ja            # Latin + Japanisch
@@ -835,11 +834,6 @@ def main() -> None:
              "Mit Verzeichnis: dorthin verschieben.",
     )
     parser.add_argument(
-        "--live",
-        action="store_true",
-        help="Fehlgeschlagene Dateien nach dem Lauf interaktiv nachbearbeiten",
-    )
-    parser.add_argument(
         "--api-key",
         help="TMDB API-Key (alternativ: Umgebungsvariable TMDB_API_KEY)",
     )
@@ -944,7 +938,7 @@ def main() -> None:
         lang_locales = detected_locales
         print(f"Erkannte Locales im Format: {', '.join(sorted(lang_locales))}")
 
-    # live_mode benötigt lang_locales erst später, hier nur definieren
+    # lang_locales wird erst später benötigt, hier nur definieren
 
     # ── Undo-Modus ────────────────────────────────────────────────────────────
     if args.undo:
@@ -1181,7 +1175,7 @@ def main() -> None:
     if cache_dirty or (execute and rename_log):
         cache_save(cache_path, cache)
 
-    # ── Live-Modus ────────────────────────────────────────────────────────────
+    # ── Interaktive Nachbearbeitung fehlgeschlagener Einträge ─────────────────
     live_resolved: list[tuple[str, str]] = []
     if failed:
         live_resolved = live_mode(
