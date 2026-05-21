@@ -1099,6 +1099,18 @@ def main() -> None:
                 errors += 1
                 continue
 
+            # Jahres-Sanity-Check: Dateiname hat explizites Jahr → TMDB-Ergebnis muss passen
+            if parsed_year:
+                result_year = (result.get("release_date") or "")[:4]
+                if result_year and abs(int(result_year) - int(parsed_year)) > 1:
+                    failed.append((
+                        filename,
+                        f"Jahreskonflikt: Dateiname={parsed_year}, TMDB={result_year} "
+                        f"({result.get('original_title', '')})",
+                    ))
+                    errors += 1
+                    continue
+
             chosen             = choose_title(result, api_key, keep_original_langs, locale=locale)
             release_date       = result.get("release_date", "")
             tmdb_year          = release_date[:4] if release_date else parsed_year or "????"
@@ -1171,7 +1183,7 @@ def main() -> None:
 
     # ── Live-Modus ────────────────────────────────────────────────────────────
     live_resolved: list[tuple[str, str]] = []
-    if args.live and failed:
+    if failed:
         live_resolved = live_mode(
             failed, directory, dest_dir, args.sep, api_key, cache, execute,
             nfo=args.nfo,
@@ -1228,7 +1240,7 @@ def main() -> None:
             print(f"    → {new}")
 
     if failed:
-        hint = "  (mit --live interaktiv nachbearbeiten)" if not args.live else ""
+        hint = ""
         print(f"\nFehlgeschlagen ({len(failed)}){hint}:")
         for fn, reason in failed:
             print(f"  ✗ {fn}")
