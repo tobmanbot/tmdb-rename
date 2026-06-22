@@ -65,8 +65,11 @@ Undo:   python3 tmdb-rename.py . --undo .tmdb-rename-backup-2024-01-15_20-30.jso
 
 ### Dateien in ein anderes Verzeichnis verschieben
 
+`--execute` ohne Argument → **in-place umbenennen**  
+`--execute /zielverzeichnis` → **umbenennen und dorthin verschieben**
+
 ```bash
-python3 tmdb-rename.py /quelle --api-key XYZ --execute /ziel
+python3 tmdb-rename.py --api-key XYZ --execute /media/filme
 ```
 
 ---
