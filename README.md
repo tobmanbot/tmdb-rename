@@ -36,17 +36,37 @@ export TMDB_API_KEY=dein_key_hier
 
 ---
 
-## Schnellstart
+## Standard-Workflow
+
+Der typische Ablauf arbeitet im **aktuellen Verzeichnis** mit **in-place-Umbenennung**:
 
 ```bash
-# Dry-Run: Vorschau ohne Änderungen
-python3 tmdb-rename.py /pfad/zu/filmen
+cd /pfad/zu/filmen
 
-# Dateien in-place umbenennen
-python3 tmdb-rename.py /pfad/zu/filmen --execute
+# Schritt 1: Dry-Run — TMDB-Suche, Vorschau, Live-Mode für unbekannte Dateien
+python3 tmdb-rename.py --api-key XYZ
 
-# Dateien umbenennen und in neues Verzeichnis verschieben
-python3 tmdb-rename.py /quelle --execute /ziel
+# Schritt 2: Umbenennung wirklich durchführen (Cache wird genutzt, kein API-Key nötig)
+python3 tmdb-rename.py --execute
+```
+
+Oder in einem Schritt:
+
+```bash
+python3 tmdb-rename.py --api-key XYZ --execute
+```
+
+Nach `--execute` gibt das Programm automatisch den passenden Undo-Befehl aus:
+
+```
+Backup: .tmdb-rename-backup-2024-01-15_20-30.json
+Undo:   python3 tmdb-rename.py . --undo .tmdb-rename-backup-2024-01-15_20-30.json --execute
+```
+
+### Dateien in ein anderes Verzeichnis verschieben
+
+```bash
+python3 tmdb-rename.py /quelle --api-key XYZ --execute /ziel
 ```
 
 ---
@@ -57,7 +77,7 @@ python3 tmdb-rename.py /quelle --execute /ziel
 
 | Option | Beschreibung |
 |---|---|
-| `--execute [ZIELDIR]` | Umbenennung durchführen. Ohne Argument: in-place. Mit Pfad: dorthin verschieben. |
+| `--execute [ZIELDIR]` | Umbenennung durchführen. Ohne Argument: **in-place** (Standard). Mit Pfad: dorthin verschieben. |
 | `--api-key KEY` | TMDB API-Key (alternativ: Umgebungsvariable `TMDB_API_KEY`) |
 | `--sep ZEICHEN` | Trennzeichen innerhalb von Titelwörtern (Standard: `.`, Alternative: ` `) |
 | `--delay SEKUNDEN` | Pause zwischen API-Anfragen (Standard: `0.3`) |
