@@ -436,7 +436,7 @@ def parse_scene_filename(filename: str) -> tuple[str, str | None]:
 
     # Marker 4: Bereinigung
     raw_title = SCENE_GARBAGE.sub(" ", raw_title)
-    raw_title = re.sub(r"[-–—\s]+$", "", raw_title).strip()
+    raw_title = re.sub(r"[({\[\-–—\s]+$", "", raw_title).strip()
     raw_title = re.sub(r"^[-–—\s]+", "", raw_title).strip()
     raw_title = re.sub(r"\s{2,}", " ", raw_title)
 
@@ -606,9 +606,11 @@ def find_sidecar_files(directory: str, stem: str) -> list[str]:
 # ─── Live-Modus ───────────────────────────────────────────────────────────────
 
 def live_mode(
-    failed: list[tuple[str, str]],
-    directory: str,
+    failed: list[tuple[str, str, str]],
     dest_dir: str,
+    move_mode: bool,
+    root_dir: str,
+    skip_source_dirs: bool,
     sep: str,
     api_key: str,
     cache: dict,
@@ -618,27 +620,57 @@ def live_mode(
     fmt: str = DEFAULT_FORMAT,
     lang_locales: set[str] | None = None,
     locale: str | None = None,
-) -> list[tuple[str, str]]:
+) -> list[dict]:
     """
     Interaktiver Modus für nicht erkannte Dateien.
-    Gibt Liste der dabei erfolgreich aufgelösten (old, new) zurück.
+    Gibt Liste der dabei erfolgreich aufgelösten Einträge zurück.
     """
     if not failed:
         return []
-    if not api_key:
-        print("⚠ Live-Modus benötigt einen API-Key.")
-        return []
 
-    resolved: list[tuple[str, str]] = []
+    resolved: list[dict] = []
+
+    def _skip_as_correct(fn: str, file_dir: str, file_dst_dir: str) -> None:
+        """
+        Überspringen als 'korrekt benannt': Datei aus 'failed' herausnehmen.
+        Im Move-Mode wird sie zusätzlich unverändert nach dest_dir verschoben.
+        """
+        fn_stem = os.path.splitext(fn)[0]
+        sc_list = [f for f in find_sidecar_files(file_dir, fn_stem) if f != fn]
+        sc_log  = [{"old": sc, "new": sc} for sc in sc_list]
+        if move_mode and execute:
+            try:
+                os.makedirs(file_dst_dir, exist_ok=True)
+                os.rename(os.path.join(file_dir, fn), os.path.join(file_dst_dir, fn))
+                for sc in sc_list:
+                    os.rename(os.path.join(file_dir, sc), os.path.join(file_dst_dir, sc))
+                resolved.append({"old": fn, "new": fn, "sidecars": sc_log})
+                print("  ✓ verschoben (unverändert).")
+            except OSError as e:
+                print(f"  ✗ Fehler: {e}")
+        elif move_mode:
+            resolved.append({"old": fn, "new": fn, "sidecars": sc_log})
+            print(f"  → {fn}  (Dry-Run, würde verschieben ohne Umbenennung)")
+        else:
+            resolved.append({"old": fn, "new": fn, "sidecars": sc_log})
+            print("  ✓ übersprungen (als korrekt benannt markiert).")
 
     print(f"\n{'═' * 80}")
     print(f"LIVE-MODUS — {len(failed)} nicht erkannte Datei(en)")
-    print("Befehle: <Suchbegriff> [+JAHR]  |  s = überspringen  |  q = beenden")
+    print("Befehle: <Suchbegriff> [+JAHR]  |  s = überspringen (korrekt)  |  i = ignorieren  |  q = beenden")
     print(f"{'═' * 80}\n")
 
-    for filename, reason in failed:
+    for subdir_lm, filename, reason in failed:
         stem, ext = os.path.splitext(filename)
         ext = ext.lower()
+        if move_mode:
+            if skip_source_dirs:
+                file_dest_dir_lm = dest_dir
+            else:
+                rel = os.path.relpath(subdir_lm, root_dir)
+                file_dest_dir_lm = os.path.normpath(os.path.join(dest_dir, rel))
+        else:
+            file_dest_dir_lm = subdir_lm
         parsed_title, parsed_year = parse_scene_filename(filename)
 
         print(f"Datei:   {filename}")
@@ -655,13 +687,15 @@ def live_mode(
             if raw.lower() == "q":
                 print("→ Live-Modus beendet.")
                 return resolved
-            if raw.lower() == "s" or raw == "":
-                if raw == "":
-                    # Leere Eingabe → Standard-Query nochmal versuchen
-                    raw = parsed_title
-                else:
-                    print("  übersprungen.")
-                    break
+            if raw.lower() == "s":
+                _skip_as_correct(filename, subdir_lm, file_dest_dir_lm)
+                break
+            if raw.lower() == "i":
+                print("  ignoriert.")
+                break
+            if raw == "":
+                # Leere Eingabe → Standard-Query nochmal versuchen
+                raw = parsed_title
 
             # Jahr aus Query extrahieren falls angegeben: "titel +2024"
             year_override = parsed_year
@@ -669,6 +703,10 @@ def live_mode(
             if year_in_query:
                 year_override = year_in_query.group(1)
                 raw = raw[: year_in_query.start()].strip()
+
+            if not api_key:
+                print("  ⚠ Kein API-Key — Suche nicht möglich. [s]=korrekt  [i]=ignorieren  [q]=beenden")
+                continue
 
             try:
                 results = tmdb_search_raw(raw, year_override, api_key, limit=7, locale=locale)
@@ -689,6 +727,8 @@ def live_mode(
                 extra = f" / {loc}" if loc != orig else ""
                 print(f"  [{i}] {orig}{extra} ({rd})")
             print("  [0] Erneut suchen")
+            print("  [s] Überspringen (korrekt benannt)")
+            print("  [i] Ignorieren (unbekannt)")
 
             try:
                 choice = input("Auswahl: ").strip()
@@ -698,6 +738,12 @@ def live_mode(
 
             if choice == "0" or choice == "":
                 continue
+            if choice.lower() == "s":
+                _skip_as_correct(filename, subdir_lm, file_dest_dir_lm)
+                break
+            if choice.lower() == "i":
+                print("  ignoriert.")
+                break
             if not choice.isdigit() or not (1 <= int(choice) <= len(results)):
                 print("  Ungültige Auswahl.")
                 continue
@@ -732,32 +778,44 @@ def live_mode(
 
             print(f"  → {new_name}")
 
-            sidecars = [f for f in find_sidecar_files(directory, stem) if f != filename]
+            # Bereits korrekt benannt? (Ziel == Quelle, kein effektiver Move)
+            if new_name == filename and os.path.realpath(file_dest_dir_lm) == os.path.realpath(subdir_lm):
+                print("  ✓ bereits korrekt benannt — keine Umbenennung nötig.")
+                resolved.append({"old": filename, "new": filename, "sidecars": []})
+                break
 
-            final_stem, final_name = unique_dest(dest_dir, new_stem, ext)
+            sidecars = [f for f in find_sidecar_files(subdir_lm, stem) if f != filename]
+
+            final_stem, final_name = unique_dest(file_dest_dir_lm, new_stem, ext)
             if final_name != new_name:
                 print(f"  ⚠ Duplikat → {final_name}")
 
+            sc_log = [
+                {"old": sc, "new": f"{final_stem}{sc[len(stem):]}"}  
+                for sc in sidecars
+            ]
+
             if execute:
                 try:
-                    src = os.path.join(directory, filename)
-                    dst = os.path.join(dest_dir, final_name)
+                    src = os.path.join(subdir_lm, filename)
+                    dst = os.path.join(file_dest_dir_lm, final_name)
+                    os.makedirs(file_dest_dir_lm, exist_ok=True)
                     os.rename(src, dst)
                     for sc in sidecars:
                         sc_suffix = sc[len(stem):]
                         sc_new    = f"{final_stem}{sc_suffix}"
                         os.rename(
-                            os.path.join(directory, sc),
-                            os.path.join(dest_dir, sc_new),
+                            os.path.join(subdir_lm, sc),
+                            os.path.join(file_dest_dir_lm, sc_new),
                         )
                     if nfo:
-                        write_nfo(dest_dir, final_stem, chosen, tmdb_year, result["id"])
-                    resolved.append((filename, final_name))
+                        write_nfo(file_dest_dir_lm, final_stem, chosen, tmdb_year, result["id"])
+                    resolved.append({"old": filename, "new": final_name, "old_dir": subdir_lm, "new_dir": file_dest_dir_lm, "sidecars": sc_log})
                     print("  ✓ verschoben.")
                 except OSError as e:
                     print(f"  ✗ Fehler: {e}")
             else:
-                resolved.append((filename, final_name))
+                resolved.append({"old": filename, "new": final_name, "old_dir": subdir_lm, "new_dir": file_dest_dir_lm, "sidecars": sc_log})
                 print("  (Dry-Run, nicht verschoben)")
             break
 
@@ -792,18 +850,30 @@ def undo_renames(backup_path: str, execute: bool) -> None:
     ok = err = 0
     for entry in renames:
         old, new = entry["old"], entry["new"]
-        current = os.path.join(dest_dir, new)
-        restore = os.path.join(src_dir,  old)
+        sidecars     = entry.get("sidecars", [])
+        entry_old_dir = entry.get("old_dir", src_dir)
+        entry_new_dir = entry.get("new_dir", dest_dir)
+        current = os.path.join(entry_new_dir, new)
+        restore = os.path.join(entry_old_dir, old)
         if not os.path.exists(current):
             print(f"  ⚠ nicht vorhanden (schon zurück?): {new}")
             err += 1
             continue
-        arrow = f"{dest_dir}/{new}" if move_mode else new
+        arrow = f"{entry_new_dir}/{new}" if move_mode else new
         print(f"  {arrow}")
-        print(f"    → {src_dir}/{old}")
+        print(f"    → {entry_old_dir}/{old}")
+        for sc in sidecars:
+            print(f"    → sidecar: {sc['new']} → {sc['old']}")
         if execute:
             try:
                 os.rename(current, restore)
+                for sc in sidecars:
+                    sc_cur = os.path.join(entry_new_dir, sc["new"])
+                    sc_res = os.path.join(entry_old_dir, sc["old"])
+                    if os.path.exists(sc_cur):
+                        os.rename(sc_cur, sc_res)
+                    else:
+                        print(f"    ⚠ Sidecar nicht vorhanden: {sc['new']}")
                 ok += 1
             except OSError as e:
                 print(f"    ✗ Fehler: {e}")
@@ -816,6 +886,28 @@ def undo_renames(backup_path: str, execute: bool) -> None:
     print(f"{verb}: {ok}  |  Fehler: {err}")
     if not execute:
         print("→ Mit --execute wirklich zurücksetzen.")
+
+
+# ─── Rekursive Dateiliste ────────────────────────────────────────────────────
+
+def collect_video_files(root_dir: str, max_depth: int | None) -> list[tuple[str, str]]:
+    """
+    Sammelt Videodateien rekursiv in root_dir und Unterverzeichnissen.
+    max_depth=None → alle Ebenen; max_depth=N → max N Ebenen tief
+    (1 = nur direkte Unterverzeichnisse).
+    Gibt sortierte Liste von (subdir_abs, filename) zurück.
+    """
+    result: list[tuple[str, str]] = []
+    root_depth = root_dir.rstrip(os.sep).count(os.sep)
+    for dirpath, dirnames, filenames in os.walk(root_dir):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        current_depth = dirpath.rstrip(os.sep).count(os.sep) - root_depth
+        if max_depth is not None and current_depth >= max_depth:
+            dirnames.clear()
+        for f in sorted(filenames):
+            if os.path.splitext(f)[1].lower() in VIDEO_EXTS and not f.startswith("._"):
+                result.append((dirpath, f))
+    return result
 
 
 # ─── Hauptprogramm ────────────────────────────────────────────────────────────
@@ -905,6 +997,23 @@ def main() -> None:
         metavar="BACKUP_JSON",
         help="Umbenennung rückgängig machen anhand einer Backup-JSON-Datei",
     )
+    parser.add_argument(
+        "--skip-source-dirs",
+        action="store_true",
+        help="Bei --execute /ziel: alle Dateien flach ins Zielverzeichnis verschieben (altes Verhalten). "
+             "Ohne diesen Flag wird die Unterverzeichnis-Struktur im Zielverzeichnis gespiegelt.",
+    )
+    parser.add_argument(
+        "--recursive", "-r",
+        nargs="?",
+        default=False,
+        const=None,
+        type=int,
+        metavar="N",
+        help="Unterverzeichnisse einbeziehen. Ohne N: alle Ebenen. "
+             "Mit N: max N Ebenen tief (z.B. -r1 = nur direkte Unterverzeichnisse, "
+             "-r2 = zwei Ebenen tief).",
+    )
     args = parser.parse_args()
 
     # ── --force-ffprobe prüfen ─────────────────────────────────────────────
@@ -957,14 +1066,12 @@ def main() -> None:
 
     # ── API-Key bestimmen ─────────────────────────────────────────────────────
     api_key = args.api_key or os.environ.get("TMDB_API_KEY", "")
-    if not api_key and not cache:
-        print("FEHLER: Kein API-Key und kein Cache vorhanden.")
-        print("  Option A: --api-key KEY")
-        print("  Option B: export TMDB_API_KEY=KEY")
-        print("  API-Key holen: https://www.themoviedb.org/settings/api")
-        sys.exit(1)
     if not api_key:
-        print(f"⚠ Kein API-Key — nur Cache wird verwendet ({len(cache)} Einträge).")
+        if cache:
+            print(f"⚠ Kein API-Key — nur Cache wird verwendet ({len(cache)} Einträge).")
+        else:
+            print("⚠ Kein API-Key und kein Cache — nur bereits korrekt benannte Dateien werden verarbeitet.")
+            print("  Für TMDB-Suche: --api-key KEY  oder  export TMDB_API_KEY=KEY")
 
     # ── Modus bestimmen ───────────────────────────────────────────────────────
     execute   = args.execute is not None
@@ -982,41 +1089,83 @@ def main() -> None:
         modus = "DRY-RUN (nur Vorschau)"
 
     # ── Dateien sammeln ───────────────────────────────────────────────────────
-    video_files = sorted(
-        f for f in os.listdir(directory)
-        if os.path.splitext(f)[1].lower() in VIDEO_EXTS
-        and not f.startswith("._")   # AppleDouble-Dateien (macOS) ignorieren
-    )
-    total = len(video_files)
+    if args.recursive is not False:
+        video_items = collect_video_files(directory, args.recursive)
+        if args.recursive is None:
+            recursive_info = " (rekursiv, alle Ebenen)"
+        else:
+            ebenen = "Ebene" if args.recursive == 1 else "Ebenen"
+            recursive_info = f" (rekursiv, max {args.recursive} {ebenen})"
+    else:
+        video_items = [
+            (directory, f) for f in sorted(
+                f for f in os.listdir(directory)
+                if os.path.splitext(f)[1].lower() in VIDEO_EXTS
+                and not f.startswith("._")  # AppleDouble-Dateien (macOS) ignorieren
+            )
+        ]
+        recursive_info = ""
+    total = len(video_items)
 
-    print(f"Verzeichnis:  {directory}")
+    print(f"Verzeichnis:  {directory}{recursive_info}")
     print(f"Videodateien: {total}")
     print(f"Cache:        {cache_path} ({len(cache)} Einträge)")
     print(f"Modus:        {modus}")
     print("─" * 80)
 
     renamed = skipped = errors = unchanged = 0
-    rename_log: list[tuple[str, str]] = []
-    failed:     list[tuple[str, str]] = []
+    rename_log:      list[dict]  = []
+    already_correct: list[str]  = []
+    failed:          list[tuple[str, str, str]] = []
     w = len(str(total))
     cache_dirty = False
 
-    for idx, filename in enumerate(video_files, 1):
+    for idx, (subdir, filename) in enumerate(video_items, 1):
         stem, ext = os.path.splitext(filename)
         ext = ext.lower()
+        if move_mode:
+            if args.skip_source_dirs:
+                file_dest_dir = dest_dir
+            else:
+                rel = os.path.relpath(subdir, directory)
+                file_dest_dir = os.path.normpath(os.path.join(dest_dir, rel))
+        else:
+            file_dest_dir = subdir
 
         pct = idx / total * 100
-        print(f"[{idx:>{w}}/{total}] {pct:5.1f}%  {filename[:65]:<65}", end="\r", flush=True)
+        rel = os.path.relpath(os.path.join(subdir, filename), directory)
+        print(f"[{idx:>{w}}/{total}] {pct:5.1f}%  {rel[:65]:<65}", end="\r", flush=True)
 
         # Bereits im Zielformat?
         already_clean = bool(re.match(r"^.+\(\d{4}\)$", stem))
         if already_clean and args.skip_found:
-            unchanged += 1
+            if move_mode:
+                sidecars = [f for f in find_sidecar_files(subdir, stem) if f != filename]
+                sc_log = [{"old": sc, "new": sc} for sc in sidecars]
+                if execute:
+                    try:
+                        os.makedirs(file_dest_dir, exist_ok=True)
+                        os.rename(os.path.join(subdir, filename), os.path.join(file_dest_dir, filename))
+                        for sc in sidecars:
+                            sc_src = os.path.join(subdir, sc)
+                            sc_dst = os.path.join(file_dest_dir, sc)
+                            if not os.path.exists(sc_dst):
+                                os.rename(sc_src, sc_dst)
+                        renamed += 1
+                        rename_log.append({"old": filename, "new": filename, "old_dir": subdir, "new_dir": file_dest_dir, "sidecars": sc_log})
+                    except OSError as e:
+                        errors += 1
+                else:
+                    renamed += 1
+                    rename_log.append({"old": filename, "new": filename, "old_dir": subdir, "new_dir": file_dest_dir, "sidecars": sc_log})
+            else:
+                already_correct.append(os.path.relpath(os.path.join(subdir, filename), directory))
+                unchanged += 1
             continue
 
         parsed_title, parsed_year = parse_scene_filename(filename)
         if not parsed_title:
-            failed.append((filename, "kein Titel parsebar"))
+            failed.append((subdir, filename, "kein Titel parsebar"))
             skipped += 1
             continue
 
@@ -1050,7 +1199,7 @@ def main() -> None:
                 extra_titles = cached_locs
         elif api_key:
             # ── TMDB-Suche ────────────────────────────────────────────────────
-            filepath = os.path.join(directory, filename)
+            filepath = os.path.join(subdir, filename)
             mkv_title: str | None = None
             if ext == ".mkv":
                 mkv_title = get_mkv_title(filepath)
@@ -1084,12 +1233,12 @@ def main() -> None:
                         print(f"\n  ℹ {filename}")
                         print( "    Tipp: ffprobe installieren (ffmpeg-Paket) für MKV-Metadaten-Fallback")
             except RuntimeError as e:
-                failed.append((filename, f"API-Fehler: {e}"))
+                failed.append((subdir, filename, f"API-Fehler: {e}"))
                 errors += 1
                 continue
 
             if not result:
-                failed.append((filename, f"nicht gefunden — geparst: '{parsed_title}' ({parsed_year or '—'})"))
+                failed.append((subdir, filename, f"nicht gefunden — geparst: '{parsed_title}' ({parsed_year or '—'})"))
                 errors += 1
                 continue
 
@@ -1098,6 +1247,7 @@ def main() -> None:
                 result_year = (result.get("release_date") or "")[:4]
                 if result_year and abs(int(result_year) - int(parsed_year)) > 1:
                     failed.append((
+                        subdir,
                         filename,
                         f"Jahreskonflikt: Dateiname={parsed_year}, TMDB={result_year} "
                         f"({result.get('original_title', '')})",
@@ -1129,7 +1279,33 @@ def main() -> None:
             cache_dirty = True
         else:
             # Kein API-Key, nicht im Cache
-            failed.append((filename, "nicht im Cache — kein API-Key"))
+            if already_clean:
+                # Dateiname bereits im Zielformat — direkt verschieben ohne TMDB-Lookup
+                if move_mode:
+                    sidecars = [f for f in find_sidecar_files(subdir, stem) if f != filename]
+                    sc_log = [{"old": sc, "new": sc} for sc in sidecars]
+                    if execute:
+                        try:
+                            os.makedirs(file_dest_dir, exist_ok=True)
+                            os.rename(os.path.join(subdir, filename), os.path.join(file_dest_dir, filename))
+                            for sc in sidecars:
+                                sc_src = os.path.join(subdir, sc)
+                                sc_dst = os.path.join(file_dest_dir, sc)
+                                if not os.path.exists(sc_dst):
+                                    os.rename(sc_src, sc_dst)
+                            renamed += 1
+                            rename_log.append({"old": filename, "new": filename, "old_dir": subdir, "new_dir": file_dest_dir, "sidecars": sc_log})
+                        except OSError as e:
+                            failed.append((subdir, filename, str(e)))
+                            errors += 1
+                    else:
+                        renamed += 1
+                        rename_log.append({"old": filename, "new": filename, "old_dir": subdir, "new_dir": file_dest_dir, "sidecars": sc_log})
+                else:
+                    already_correct.append(os.path.relpath(os.path.join(subdir, filename), directory))
+                    unchanged += 1
+                continue
+            failed.append((subdir, filename, "nicht im Cache — kein API-Key"))
             errors += 1
             continue
 
@@ -1139,37 +1315,45 @@ def main() -> None:
             lang=orig_lang, original_title=original_title_raw,
         )
 
-        if new_name == filename:
+        # Bereits korrekt benannt? (Zielname == Quellname, in-place)
+        if new_name == filename and not move_mode:
+            already_correct.append(os.path.relpath(os.path.join(subdir, filename), directory))
             unchanged += 1
             continue
 
-        sidecars = [f for f in find_sidecar_files(directory, stem) if f != filename]
+        sidecars = [f for f in find_sidecar_files(subdir, stem) if f != filename]
 
         # Duplikat-Schutz: .(2), .(3) … anhängen falls Ziel belegt
-        final_stem, final_name = unique_dest(dest_dir, new_stem, ext)
+        final_stem, final_name = unique_dest(file_dest_dir, new_stem, ext)
+
+        sc_log = [
+            {"old": sc, "new": f"{final_stem}{sc[len(stem):]}"}  
+            for sc in sidecars
+        ]
 
         if execute:
             try:
-                src = os.path.join(directory, filename)
-                dst = os.path.join(dest_dir, final_name)
+                src = os.path.join(subdir, filename)
+                dst = os.path.join(file_dest_dir, final_name)
+                os.makedirs(file_dest_dir, exist_ok=True)
                 os.rename(src, dst)
                 for sc in sidecars:
                     sc_suffix = sc[len(stem):]
                     sc_new    = f"{final_stem}{sc_suffix}"
-                    sc_src    = os.path.join(directory, sc)
-                    sc_dst    = os.path.join(dest_dir, sc_new)
+                    sc_src    = os.path.join(subdir, sc)
+                    sc_dst    = os.path.join(file_dest_dir, sc_new)
                     if not os.path.exists(sc_dst):
                         os.rename(sc_src, sc_dst)
                 if args.nfo:
-                    write_nfo(dest_dir, final_stem, chosen, tmdb_year, result_id)
+                    write_nfo(file_dest_dir, final_stem, chosen, tmdb_year, result_id)
                 renamed += 1
-                rename_log.append((filename, final_name))
+                rename_log.append({"old": filename, "new": final_name, "old_dir": subdir, "new_dir": file_dest_dir, "sidecars": sc_log})
             except OSError as e:
-                failed.append((filename, str(e)))
+                failed.append((subdir, filename, str(e)))
                 errors += 1
         else:
             renamed += 1
-            rename_log.append((filename, final_name))
+            rename_log.append({"old": filename, "new": final_name, "old_dir": subdir, "new_dir": file_dest_dir, "sidecars": sc_log})
 
     # ── Cache speichern ───────────────────────────────────────────────────────
     if cache_dirty or (execute and rename_log):
@@ -1179,7 +1363,7 @@ def main() -> None:
     live_resolved: list[tuple[str, str]] = []
     if failed:
         live_resolved = live_mode(
-            failed, directory, dest_dir, args.sep, api_key, cache, execute,
+            failed, dest_dir, move_mode, directory, args.skip_source_dirs, args.sep, api_key, cache, execute,
             nfo=args.nfo,
             keep_original_langs=keep_original_langs,
             fmt=fmt_str,
@@ -1190,8 +1374,8 @@ def main() -> None:
             rename_log.extend(live_resolved)
             renamed += len(live_resolved)
             # Nur noch wirklich nicht aufgelöste in failed lassen
-            resolved_files = {fn for fn, _ in live_resolved}
-            failed = [(fn, r) for fn, r in failed if fn not in resolved_files]
+            resolved_files = {e["old"] for e in live_resolved}
+            failed = [(sd, fn, r) for sd, fn, r in failed if fn not in resolved_files]
             cache_save(cache_path, cache)
 
     # ── Backup schreiben ──────────────────────────────────────────────────────
@@ -1204,7 +1388,7 @@ def main() -> None:
             "source_directory": directory,
             "dest_directory":   dest_dir,
             "move_mode":        move_mode,
-            "renames":          [{"old": old, "new": new} for old, new in rename_log],
+            "renames":          rename_log,
         }
         with open(backup_path, "w", encoding="utf-8") as f:
             json.dump(backup_data, f, ensure_ascii=False, indent=2)
@@ -1221,6 +1405,11 @@ def main() -> None:
         verb = "Würde umbenennen"
     print(f"{verb}: {renamed}  |  Unverändert: {unchanged}  |  Fehler: {errors + skipped}")
 
+    if already_correct:
+        print(f"\nBereits korrekt benannt ({len(already_correct)}):")
+        for fn in already_correct:
+            print(f"  ✓ {fn}  (keine Umbenennung nötig)")
+
     if rename_log:
         if execute and move_mode:
             label = f"Verschobene Dateien (→ {dest_dir})"
@@ -1229,14 +1418,18 @@ def main() -> None:
         else:
             label = "Vorschau"
         print(f"\n{label} ({len(rename_log)}):")
-        for old, new in rename_log:
-            print(f"  {old}")
-            print(f"    → {new}")
+        for entry in rename_log:
+            old_dir_e = entry.get("old_dir", directory)
+            new_dir_e = entry.get("new_dir", dest_dir)
+            rel_old = os.path.relpath(os.path.join(old_dir_e, entry['old']), directory)
+            rel_new = os.path.relpath(os.path.join(new_dir_e, entry['new']), dest_dir)
+            print(f"  {rel_old}")
+            print(f"    → {rel_new}")
 
     if failed:
         hint = ""
         print(f"\nFehlgeschlagen ({len(failed)}){hint}:")
-        for fn, reason in failed:
+        for _, fn, reason in failed:
             print(f"  ✗ {fn}")
             print(f"    {reason}")
 
