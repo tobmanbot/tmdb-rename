@@ -16,8 +16,20 @@ Verwendung:
   python3 tmdb-rename.py /quelle --force-ffprobe                           # MKV-Titel als primäre Suchquelle
   python3 tmdb-rename.py /quelle --locale de-DE                            # TMDB-Suchergebnisse auf Deutsch
   python3 tmdb-rename.py /quelle --format "{title_de}{sep}{title_en}{sep}({year})"  # Zweisprachig
-  python3 tmdb-rename.py /quelle --undo backup.json                        # Dry-Run Undo
-  python3 tmdb-rename.py /quelle --undo backup.json --execute              # Undo ausführen
+  python3 tmdb-rename.py /quelle --undo backup.json                        # Dry-Run Undo (Umbenennung oder Trash)
+  python3 tmdb-rename.py /quelle --undo backup.json --execute              # Undo ausführen (funktioniert für beide)
+  python3 tmdb-rename.py /quelle --find-duplicates                         # Nur Duplikat-Suche (kein Hauptlauf, kein API-Key nötig)
+  python3 tmdb-rename.py /quelle --api-key KEY                             # Scraper (Cache ergänzen) + automatische Duplikat-Suche danach
+  python3 tmdb-rename.py /quelle                                            # Cache-Lauf + automatische Duplikat-Suche danach (kein API-Key nötig)
+
+Duplikat-Suche:
+  Läuft automatisch nach jedem Hauptlauf (auch ohne --find-duplicates).
+  Erkennt Duplikate via TMDB-ID (aus Cache) und Dateiname+Jahr (heuristisch).
+  Bei tatsächlich identischen Dateien (gleiche Größe + Laufdauer):
+    - Dateinamen werden grün hervorgehoben
+    - Die letzten Einträge (2–N) sind als Vorauswahl vorbelegt (Enter übernimmt)
+  Ausgewählte Dateien werden nach <verzeichnis>/trash/<timestamp>/ verschoben.
+  Rückgängig: python3 tmdb-rename.py /quelle --undo trash/<timestamp>/manifest.json --execute
 
 Format-Platzhalter (--format):
   {title}          Primärtitel (aus choose_title / --keep-original-title)
@@ -824,7 +836,453 @@ def live_mode(
     return resolved
 
 
+# ─── Duplikatsuche ──────────────────────────────────────────────────────────────
+
+_CODEC_DISPLAY: dict[str, str] = {
+    # Video
+    "h264": "H.264", "hevc": "H.265/HEVC", "av1": "AV1",
+    "mpeg2video": "MPEG-2", "mpeg4": "MPEG-4", "vp9": "VP9", "vp8": "VP8",
+    # Audio
+    "dts": "DTS", "ac3": "AC3", "eac3": "EAC3", "truehd": "TrueHD",
+    "aac": "AAC", "mp3": "MP3", "flac": "FLAC", "opus": "Opus",
+    "pcm_s16le": "PCM", "pcm_s24le": "PCM", "pcm_bluray": "PCM",
+    # Untertitel
+    "subrip": "SRT", "ass": "ASS", "ssa": "SSA",
+    "hdmv_pgs_subtitle": "PGS", "dvd_subtitle": "VobSub",
+    "mov_text": "TX3G", "webvtt": "WebVTT",
+}
+
+
+def get_file_info(filepath: str) -> dict:
+    """
+    Liest Video-/Audio-/Untertitel-Eigenschaften via ffprobe.
+    Gibt leeres dict zurück wenn ffprobe nicht verfügbar oder fehlschlägt.
+    """
+    if not _FFPROBE_PATH:
+        return {}
+    try:
+        out = subprocess.check_output(
+            [
+                _FFPROBE_PATH, "-v", "quiet",
+                "-print_format", "json",
+                "-show_streams", "-show_format",
+                filepath,
+            ],
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+        data = json.loads(out)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            json.JSONDecodeError, OSError):
+        return {}
+
+    fmt     = data.get("format", {})
+    streams = data.get("streams", [])
+
+    video: dict | None = None
+    audio: list[dict]  = []
+    subs:  list[str]   = []
+
+    for s in streams:
+        ct   = s.get("codec_type", "")
+        cn   = s.get("codec_name", "")
+        tags = s.get("tags") or {}
+
+        if ct == "video" and video is None:
+            color_transfer  = s.get("color_transfer", "")
+            color_primaries = s.get("color_primaries", "")
+            if color_transfer == "smpte2084":
+                hdr = "HDR10"
+            elif color_transfer == "arib-std-b67":
+                hdr = "HLG"
+            elif "bt2020" in color_primaries:
+                hdr = "HDR"
+            else:
+                hdr = ""
+            br_raw = s.get("bit_rate") or fmt.get("bit_rate") or "0"
+            try:
+                br = int(br_raw)
+            except (ValueError, TypeError):
+                br = 0
+            video = {
+                "codec":   _CODEC_DISPLAY.get(cn, cn.upper()),
+                "width":   int(s.get("width") or 0),
+                "height":  int(s.get("height") or 0),
+                "hdr":     hdr,
+                "bitrate": br,
+            }
+        elif ct == "audio":
+            ch     = int(s.get("channels") or 0)
+            ch_str = {1: "1.0", 2: "2.0", 6: "5.1", 8: "7.1"}.get(ch, str(ch) if ch else "")
+            lang   = tags.get("language") or tags.get("LANGUAGE") or ""
+            audio.append({
+                "codec":    _CODEC_DISPLAY.get(cn, cn.upper()),
+                "channels": ch_str,
+                "lang":     lang,
+            })
+        elif ct == "subtitle":
+            lang = tags.get("language") or tags.get("LANGUAGE") or ""
+            subs.append(lang or "?")
+
+    size = int(fmt.get("size") or 0)
+    try:
+        duration = float(fmt.get("duration") or 0)
+    except (ValueError, TypeError):
+        duration = 0.0
+
+    return {"video": video, "audio": audio, "subtitles": subs,
+            "size": size, "duration": duration}
+
+
+_ANSI_GREEN = "\033[32m"
+_ANSI_RESET = "\033[0m"
+
+
+def _files_identical(infos: list[dict]) -> bool:
+    """
+    True wenn alle Dateien dieselbe Größe und Laufdauer haben
+    → wahrscheinlich exakte Kopien (Byte-für-Byte-Vergleich spare ich mir
+    bei großen Video-Dateien).
+    """
+    if len(infos) < 2:
+        return False
+    sizes     = [i.get("size", 0)       for i in infos]
+    durations = [i.get("duration", 0.0) for i in infos]
+    # Größe muss identisch und > 0
+    if not all(s == sizes[0] and s > 0 for s in sizes):
+        return False
+    # Dauer identisch (±1 s Toleranz), wenn vorhanden
+    if all(d > 0 for d in durations):
+        if max(durations) - min(durations) > 1.0:
+            return False
+    return True
+
+
+def _print_file_card(idx: int, rel: str, info: dict, indent: str = "  ", green: bool = False) -> None:
+    """Gibt eine kompakte Datei-Info-Karte auf stdout aus."""
+    size = info.get("size", 0)
+    if size >= 1024 ** 3:
+        size_str = f"{size / (1024 ** 3):.1f} GB"
+    elif size > 0:
+        size_str = f"{size / (1024 ** 2):.0f} MB"
+    else:
+        size_str = ""
+    dur   = info.get("duration", 0)
+    h, m  = divmod(int(dur) // 60, 60)
+    dur_str = (f"{h}h{m:02d}m" if h else f"{m}m") if dur > 0 else ""
+    meta  = "  ·  ".join(s for s in [size_str, dur_str] if s)
+
+    name_str = f"{_ANSI_GREEN}{rel}{_ANSI_RESET}" if green else rel
+    print(f"{indent}[{idx}] {name_str}")
+    if meta:
+        print(f"{indent}     {meta}")
+
+    v = info.get("video")
+    if v:
+        vparts: list[str] = [p for p in [
+            v.get("codec", ""),
+            f"{v['width']}×{v['height']}" if v.get("width") else "",
+            v.get("hdr", ""),
+            f"{v['bitrate'] / 1_000_000:.1f} Mbps" if v.get("bitrate", 0) > 100_000 else "",
+        ] if p]
+        if vparts:
+            print(f"{indent}     Video:  {' · '.join(vparts)}")
+
+    a_tracks = info.get("audio", [])
+    if a_tracks:
+        def _fmt_track(a: dict) -> str:
+            return "  ".join(p for p in [
+                a.get("codec", ""), a.get("channels", ""), a.get("lang", "")
+            ] if p)
+        print(f"{indent}     Audio:  {'  |  '.join(_fmt_track(a) for a in a_tracks)}")
+
+    sub_langs = info.get("subtitles", [])
+    if sub_langs:
+        print(f"{indent}     Subs:   {' · '.join(sub_langs)}")
+
+
+def find_duplicates(directory: str, cache: dict) -> None:
+    """
+    Sucht Duplikate in Unterverzeichnissen, zeigt Datei-Eigenschaften (ffprobe)
+    und bietet interaktiven Dialog. Ausgewählte Duplikate werden in
+    <directory>/trash/<timestamp>/ verschoben (mit manifest.json).
+    """
+    from collections import defaultdict
+
+    trash_base = os.path.join(directory, "trash")
+
+    # Videodateien sammeln – trash/-Unterordner ausschließen
+    raw_items   = collect_video_files(directory, max_depth=None)
+    video_items = [
+        (sd, fn) for sd, fn in raw_items
+        if sd != trash_base and not sd.startswith(trash_base + os.sep)
+    ]
+
+    if not video_items:
+        print("Keine Videodateien gefunden.")
+        return
+
+    print(f"Analysiere {len(video_items)} Videodateien in: {directory}")
+    print("─" * 80)
+
+    by_tmdb:  dict[int,             list[tuple[str, str]]] = defaultdict(list)
+    by_title: dict[tuple[str, str], list[tuple[str, str]]] = defaultdict(list)
+
+    for subdir, filename in video_items:
+        cached = cache.get(filename)
+        if cached and isinstance(cached.get("id"), int):
+            by_tmdb[cached["id"]].append((subdir, filename))
+        title, year = parse_scene_filename(filename)
+        if title:
+            by_title[(_norm_title_cmp(title), year or "")].append((subdir, filename))
+
+    tmdb_dups = sorted(
+        [(tid, items) for tid, items in by_tmdb.items() if len(items) > 1],
+        key=lambda x: str(x[0]),
+    )
+    tmdb_files: set[str] = {
+        os.path.join(sd, fn) for _, items in tmdb_dups for sd, fn in items
+    }
+    title_dups = [
+        (key, items) for key, items in sorted(by_title.items())
+        if len(items) >= 2
+        and sum(1 for sd, fn in items if os.path.join(sd, fn) not in tmdb_files) >= 2
+    ]
+
+    all_groups: list[tuple[str, object, list[tuple[str, str]]]] = [
+        ("tmdb",  tid, items) for tid, items in tmdb_dups
+    ] + [
+        ("title", key, items) for key, items in title_dups
+    ]
+
+    if not all_groups:
+        print("✓ Keine Duplikate gefunden.")
+        return
+
+    if not _FFPROBE_PATH:
+        print("⚠ ffprobe nicht gefunden — Datei-Eigenschaften nicht verfügbar.")
+        print("  Installieren: sudo pacman -S ffmpeg\n")
+
+    n_groups = len(all_groups)
+    print(f"\n{n_groups} Duplikat-Gruppe(n) gefunden.")
+    print("Befehle: Nummer(n)  |  b = alle markieren  |  s = überspringen  |  q = weiter zur Zusammenfassung\n")
+
+    to_trash: list[dict] = []
+    quit_interactive = False
+
+    for g_idx, (g_type, g_key, items) in enumerate(all_groups, 1):
+        if quit_interactive:
+            break
+
+        # ── Gruppen-Header ────────────────────────────────────────────────────
+        if g_type == "tmdb":
+            sample = cache.get(items[0][1]) or {}
+            orig   = sample.get("original_title", f"TMDB #{g_key}")
+            yr     = (sample.get("release_date") or "")[:4]
+            label  = f"{orig} ({yr})" if yr else str(orig)
+            badge  = f"🎯 TMDB #{g_key}"
+        else:
+            norm_t, yr = g_key  # type: ignore[misc]
+            label  = f"{norm_t} ({yr})" if yr else norm_t
+            badge  = "🔍 Dateiname"
+
+        print("═" * 80)
+        print(f"Gruppe {g_idx}/{n_groups}  {badge}  {label}")
+        print("─" * 80)
+
+        # ── Datei-Karten ──────────────────────────────────────────────────────
+        file_cards: list[dict] = []
+        for card_idx, (sd, fn) in enumerate(items, 1):
+            fpath = os.path.join(sd, fn)
+            rel   = os.path.relpath(fpath, directory)
+            info  = get_file_info(fpath)
+            file_cards.append({"sd": sd, "fn": fn, "fpath": fpath, "rel": rel, "info": info})
+
+        # Sind alle Dateien inhaltlich identisch (gleiche Größe + Dauer)?
+        identical = _files_identical([fc["info"] for fc in file_cards])
+        # Vorauswahl: bei identischen Dateien alle außer der ersten markieren (2..N)
+        default_idxs: list[int] = list(range(1, len(file_cards))) if identical else []
+
+        for card_idx, fc in enumerate(file_cards, 1):
+            _print_file_card(card_idx, fc["rel"], fc["info"], green=identical)
+            print()
+
+        # ── Eingabe ───────────────────────────────────────────────────────────
+        if default_idxs:
+            default_str = ",".join(str(i + 1) for i in default_idxs)
+            _prompt = f"  Markieren [1\u2013{len(items)}/b/s/q, Enter={default_str}]: "
+        else:
+            _prompt = f"  Markieren [1\u2013{len(items)}/b/s/q]: "
+
+        chosen_idxs: list[int] = []
+        while True:
+            try:
+                raw = input(_prompt).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                raw = "q"
+
+            if raw == "q":
+                quit_interactive = True
+                break
+            if raw == "s":
+                print("  übersprungen.\n")
+                break
+            if raw == "":
+                if default_idxs:
+                    chosen_idxs = default_idxs
+                    print(f"  ✓ Vorauswahl übernommen: {', '.join(str(i + 1) for i in default_idxs)}\n")
+                else:
+                    print("  übersprungen.\n")
+                break
+            if raw in ("b", "beide", "all", "alle"):
+                chosen_idxs = list(range(len(items)))
+                break
+
+            # Zahlen parsen: "1", "2", "1 2", "1,2"
+            tokens = re.split(r"[\s,]+", raw)
+            new_idxs: list[int] = []
+            valid = True
+            for t in tokens:
+                if t.isdigit() and 1 <= int(t) <= len(items):
+                    new_idxs.append(int(t) - 1)
+                elif t:
+                    print(f"  Ungültig: '{t}' — erwartet 1\u2013{len(items)}, b, s oder q.")
+                    valid = False
+                    break
+            if not valid:
+                continue
+            chosen_idxs = new_idxs
+            if not chosen_idxs:
+                print("  übersprungen.\n")
+            break
+
+        for ci in chosen_idxs:
+            fc = file_cards[ci]
+            to_trash.append({
+                "filepath": fc["fpath"],
+                "rel":      fc["rel"],
+                "info":     fc["info"],
+                "reason":   f"Duplikat – Gruppe {g_idx} ({badge}: {label})",
+            })
+        if chosen_idxs:
+            print(f"  ✓ {len(chosen_idxs)} Datei(en) markiert.\n")
+
+    # ── Zusammenfassung ───────────────────────────────────────────────────────
+    print("═" * 80)
+
+    if not to_trash:
+        print("Nichts markiert — fertig.")
+        return
+
+    total_bytes = sum(e["info"].get("size", 0) for e in to_trash)
+    freed_str   = (
+        f"{total_bytes / (1024 ** 3):.1f} GB"
+        if total_bytes >= 1024 ** 3
+        else f"{total_bytes / (1024 ** 2):.0f} MB"
+    )
+    print(f"\nMarkiert zum Verschieben ({len(to_trash)} Datei(en), {freed_str} freigegeben):")
+    for e in to_trash:
+        fsz     = e["info"].get("size", 0)
+        fsz_str = f"{fsz / (1024 ** 3):.1f} GB" if fsz >= 1024 ** 3 else f"{fsz / (1024 ** 2):.0f} MB"
+        print(f"  ✗ {e['rel']}  ({fsz_str})")
+
+    try:
+        confirm = input("\nIn trash/ verschieben? [j/N] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAbgebrochen.")
+        return
+    if confirm not in ("j", "ja", "y", "yes"):
+        print("Abgebrochen — keine Dateien verschoben.")
+        return
+
+    # ── In trash/<timestamp>/ verschieben ─────────────────────────────────────
+    ts        = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
+    trash_dir = os.path.join(trash_base, ts)
+    os.makedirs(trash_dir, exist_ok=True)
+
+    manifest:    list[dict] = []
+    moved        = 0
+    move_errors  = 0
+    print()
+    for e in to_trash:
+        src      = e["filepath"]
+        dst_name = os.path.basename(src)
+        dst      = os.path.join(trash_dir, dst_name)
+        if os.path.exists(dst):
+            stem_d, ext_d = os.path.splitext(dst_name)
+            n = 2
+            while os.path.exists(dst):
+                dst = os.path.join(trash_dir, f"{stem_d}.({n}){ext_d}")
+                n += 1
+        try:
+            os.rename(src, dst)
+            manifest.append({"original": src, "trash": dst, "reason": e["reason"]})
+            print(f"  → trash/{ts}/{os.path.basename(dst)}")
+            moved += 1
+        except OSError as err:
+            print(f"  ✗ Fehler ({e['rel']}): {err}")
+            move_errors += 1
+
+    # Manifest speichern
+    manifest_path = os.path.join(trash_dir, "manifest.json")
+    with open(manifest_path, "w", encoding="utf-8") as mf:
+        json.dump({
+            "created":          ts,
+            "source_directory": directory,
+            "trash_directory":  trash_dir,
+            "files":            manifest,
+        }, mf, ensure_ascii=False, indent=2)
+
+    print(f"\n{'═' * 80}")
+    print(f"Verschoben: {moved}  |  Fehler: {move_errors}")
+    print(f"Trash:      {trash_dir}")
+    print(f"Manifest:   {manifest_path}")
+    if manifest:
+        script = os.path.basename(sys.argv[0])
+        print(f"\nUndo (Dry-Run):   python3 {script} {directory} --undo {manifest_path}")
+        print(f"Undo (ausf\u00fchren): python3 {script} {directory} --undo {manifest_path} --execute")
+
+
 # ─── Undo ─────────────────────────────────────────────────────────────────────
+
+def undo_trash(manifest_path: str, execute: bool) -> None:
+    """Stellt Dateien aus einem Trash-Manifest (find_duplicates) wieder her."""
+    with open(manifest_path, encoding="utf-8") as f:
+        data = json.load(f)
+
+    files     = data.get("files", [])
+    trash_dir = data.get("trash_directory", "")
+    created   = data.get("created", "?")
+
+    print(f"Trash vom:   {created}")
+    print(f"Trash-Ordner: {trash_dir}")
+    print(f"Dateien:     {len(files)}")
+    print(f"Modus:       {'★ EXECUTE' if execute else 'DRY-RUN'}")
+    print("─" * 80)
+
+    ok = err = 0
+    for e in files:
+        src = e["trash"]
+        dst = e["original"]
+        print(f"  {os.path.basename(src)}")
+        print(f"    → {dst}")
+        if execute:
+            try:
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                os.rename(src, dst)
+                ok += 1
+            except OSError as ex:
+                print(f"    ✗ Fehler: {ex}")
+                err += 1
+        else:
+            ok += 1
+
+    print("═" * 80)
+    verb = "Wiederhergestellt" if execute else "Würde wiederherstellen"
+    print(f"{verb}: {ok}  |  Fehler: {err}")
+    if not execute:
+        print("→ Mit --execute wirklich zurücksetzen.")
+
 
 def undo_renames(backup_path: str, execute: bool) -> None:
     if not os.path.isfile(backup_path):
@@ -833,6 +1291,11 @@ def undo_renames(backup_path: str, execute: bool) -> None:
 
     with open(backup_path, encoding="utf-8") as f:
         data = json.load(f)
+
+    # Automatisch erkennen: Trash-Manifest oder Rename-Backup
+    if "files" in data and "renames" not in data:
+        undo_trash(backup_path, execute)
+        return
 
     src_dir   = data.get("source_directory") or data.get("directory", "")
     dest_dir  = data.get("dest_directory", src_dir)
@@ -1004,6 +1467,16 @@ def main() -> None:
              "Ohne diesen Flag wird die Unterverzeichnis-Struktur im Zielverzeichnis gespiegelt.",
     )
     parser.add_argument(
+        "--find-duplicates",
+        action="store_true",
+        help="Nur Duplikat-Suche ausführen, ohne Scraper-Hauptlauf (kein --api-key). "
+             "Nützlich wenn der Cache schon befüllt ist und man gezielt aufräumen will "
+             "(z.B. nach vorherigem Lauf, nach --undo, oder in einem Zielverzeichnis). "
+             "Mit --api-key wird der volle Scraper ausgeführt (Cache ergänzen) und "
+             "die Duplikat-Suche läuft danach automatisch — das Flag ist dann nicht nötig. "
+             "Ohne dieses Flag läuft die Duplikat-Suche immer automatisch nach jedem Lauf.",
+    )
+    parser.add_argument(
         "--recursive", "-r",
         nargs="?",
         default=False,
@@ -1066,6 +1539,18 @@ def main() -> None:
 
     # ── API-Key bestimmen ─────────────────────────────────────────────────────
     api_key = args.api_key or os.environ.get("TMDB_API_KEY", "")
+
+    # ── Find-Duplicates standalone (kein Scraper-Hauptlauf) ──────────────────
+    # Nur ohne API-Key: überspringt den Hauptlauf, führt nur Duplikat-Suche aus.
+    # Mit API-Key läuft der volle Scraper (Cache ergänzen) + Duplikatsuche danach.
+    if args.find_duplicates and not api_key:
+        if cache:
+            print(f"Duplikat-Suche (standalone, Cache: {len(cache)} Einträge)")
+        else:
+            print("Duplikat-Suche (standalone, kein Cache — nur Dateiname+Jahr heuristisch)")
+        find_duplicates(directory, cache)
+        return
+
     if not api_key:
         if cache:
             print(f"⚠ Kein API-Key — nur Cache wird verwendet ({len(cache)} Einträge).")
@@ -1439,6 +1924,17 @@ def main() -> None:
     elif not execute and renamed > 0:
         dest_hint = f" {dest_dir}" if move_mode else ""
         print(f"\n→ Mit --execute{dest_hint} wirklich {'verschieben' if move_mode else 'umbenennen'}.")
+
+    # ── Duplikatsuche nach dem Hauptlauf ─────────────────────────────────────
+    # Läuft immer nach jedem normalen Scraper-/Cache-Lauf (auch ohne API-Key).
+    # --find-duplicates erzwingt standalone-Modus (oben, vor dem Hauptlauf).
+    # Im Move-Mode mit --execute liegen die Dateien jetzt im Zielverzeichnis.
+    dup_dir = dest_dir if (execute and move_mode) else directory
+    print()
+    print("═" * 80)
+    print(f"DUPLIKATSUCHE  ({dup_dir})")
+    print("─" * 80)
+    find_duplicates(dup_dir, cache)
 
 
 if __name__ == "__main__":
