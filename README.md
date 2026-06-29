@@ -204,6 +204,33 @@ python3 tmdb-rename.py /filme --undo .tmdb-rename-backup-2024-01-15_20-30.json -
 
 ---
 
+## Live-Modus
+
+Dateien, die nicht automatisch erkannt werden konnten, landen im interaktiven Live-Modus:
+
+```
+Datei:   Irgendwas.German.1080p.BluRay.mkv
+Geparst: 'Irgendwas'  Jahr: —
+Grund:   nicht gefunden — geparst: 'Irgendwas' (—)
+
+Suche [Irgendwas]: Der König der Löwen +1994
+  [1] The Lion King / Der König der Löwen (1994)
+  [2] ...
+  [0] Erneut suchen
+  [s] Überspringen (korrekt benannt)
+  [i] Ignorieren
+
+Auswahl: 1
+```
+
+Befehle:
+- Freitext → neue Suche, optional `+JAHR` anhängen (z.B. `Titelname +2001`)
+- `s` → als korrekt benannt überspringen (im Move-Mode: unverändert verschieben)
+- `i` → ignorieren
+- `q` → Live-Modus beenden
+
+---
+
 ## Duplikat-Suche
 
 Nach jedem normalen Lauf (mit oder ohne `--api-key`) startet die Duplikat-Suche automatisch. Mit `--find-duplicates` lässt sie sich auch standalone ausführen — ohne Hauptlauf, ohne API-Key:
@@ -277,33 +304,6 @@ python3 tmdb-rename.py /filme --undo trash/2024-01-15_20-30/manifest.json --exec
 ```
 
 > **Tipp:** `ffprobe` (aus dem `ffmpeg`-Paket) wird benötigt, um Dateigröße, Laufdauer und Codec-Details anzuzeigen.
-
----
-
-## Live-Modus
-
-Dateien, die nicht automatisch erkannt werden konnten, landen im interaktiven Live-Modus:
-
-```
-Datei:   Irgendwas.German.1080p.BluRay.mkv
-Geparst: 'Irgendwas'  Jahr: —
-Grund:   nicht gefunden — geparst: 'Irgendwas' (—)
-
-Suche [Irgendwas]: Der König der Löwen +1994
-  [1] The Lion King / Der König der Löwen (1994)
-  [2] ...
-  [0] Erneut suchen
-  [s] Überspringen (korrekt benannt)
-  [i] Ignorieren
-
-Auswahl: 1
-```
-
-Befehle:
-- Freitext → neue Suche, optional `+JAHR` anhängen (z.B. `Titelname +2001`)
-- `s` → als korrekt benannt überspringen (im Move-Mode: unverändert verschieben)
-- `i` → ignorieren
-- `q` → Live-Modus beenden
 
 ---
 
