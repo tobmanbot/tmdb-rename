@@ -84,6 +84,7 @@ python3 tmdb-rename.py --api-key XYZ --execute /media/filme
 | `--api-key KEY` | TMDB API-Key (alternativ: Umgebungsvariable `TMDB_API_KEY`) |
 | `--sep ZEICHEN` | Trennzeichen innerhalb von Titelwörtern (Standard: `.`, Alternative: ` `) |
 | `--delay SEKUNDEN` | Pause zwischen API-Anfragen (Standard: `0.3`) |
+| `--find-duplicates` | Nur Duplikat-Suche ausführen (kein Scraper-Hauptlauf, kein API-Key nötig) |
 
 ### Rekursion
 
@@ -200,6 +201,82 @@ python3 tmdb-rename.py /filme --undo .tmdb-rename-backup-2024-01-15_20-30.json
 # Wirklich zurücksetzen
 python3 tmdb-rename.py /filme --undo .tmdb-rename-backup-2024-01-15_20-30.json --execute
 ```
+
+---
+
+## Duplikat-Suche
+
+Nach jedem normalen Lauf (mit oder ohne `--api-key`) startet die Duplikat-Suche automatisch. Mit `--find-duplicates` lässt sie sich auch standalone ausführen — ohne Hauptlauf, ohne API-Key:
+
+```bash
+# Standalone (nutzt bestehenden Cache)
+python3 tmdb-rename.py /filme --find-duplicates
+
+# Läuft automatisch nach dem Hauptlauf
+python3 tmdb-rename.py /filme --api-key XYZ --execute
+```
+
+### Wie Duplikate erkannt werden
+
+- **TMDB-ID** (aus Cache): Gleiche ID = definitiv derselbe Film
+- **Dateiname + Jahr** (heuristisch): Normalisierter Titelvergleich auch ohne Cache
+
+### Identische Dateien
+
+Sind alle Dateien einer Gruppe tatsächlich **inhaltlich gleich** (identische Dateigröße und Laufdauer ± 1 s), hebt das Tool das automatisch hervor:
+
+- Dateinamen werden **grün** angezeigt
+- Die Einträge **2 bis N** sind als **Vorauswahl** belegt — `Enter` übernimmt sie direkt
+
+```
+═══════════════════════════════════════
+Gruppe 1/2  🎯 TMDB #12345  The Movie (2019)
+───────────────────────────────────────
+  [1] filme/The.Movie.(2019).mkv          ← grün, behalten
+       8.1 GB  · 2h18m
+       Video: H.265/HEVC · 1920×1080
+
+  [2] backup/The.Movie.(2019).mkv         ← grün, Vorauswahl
+       8.1 GB  · 2h18m
+       Video: H.265/HEVC · 1920×1080
+
+  Markieren [1–2/b/s/q, Enter=2]:
+```
+
+Einfach `Enter` drücken → Datei 2 wird markiert, Datei 1 bleibt.
+
+### Aktionen im Dialog
+
+| Eingabe | Aktion |
+|---|---|
+| `1`, `2`, … | Einzelne Datei markieren |
+| `1 2` oder `1,2` | Mehrere auf einmal markieren |
+| `b` / `alle` | Alle Dateien dieser Gruppe markieren |
+| `s` oder leer (ohne Vorauswahl) | Gruppe überspringen |
+| `Enter` (mit Vorauswahl) | Vorauswahl (2–N) übernehmen |
+| `q` | Weiter zur Zusammenfassung |
+
+### Markierte Dateien verschieben
+
+Markierte Dateien werden **nicht sofort gelöscht**, sondern in einen Trash-Ordner verschoben:
+
+```
+<verzeichnis>/trash/2024-01-15_20-30/
+  The.Movie.(2019).mkv
+  manifest.json
+```
+
+`manifest.json` enthält Herkunft und Grund jeder Datei — Rückgängig-Machen ist jederzeit möglich:
+
+```bash
+# Vorschau
+python3 tmdb-rename.py /filme --undo trash/2024-01-15_20-30/manifest.json
+
+# Wirklich zurücksetzen
+python3 tmdb-rename.py /filme --undo trash/2024-01-15_20-30/manifest.json --execute
+```
+
+> **Tipp:** `ffprobe` (aus dem `ffmpeg`-Paket) wird benötigt, um Dateigröße, Laufdauer und Codec-Details anzuzeigen.
 
 ---
 
