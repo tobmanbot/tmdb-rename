@@ -425,9 +425,11 @@ def parse_scene_filename(filename: str) -> tuple[str, str | None]:
     """
     Marker-Strategie:
       1. Release-Group-Suffix ("- GroupName" am Ende) → entfernen
-      2. Jahr (1900–2099) → primärer Schnitt-Anker
-      3. Tech-Anker ("german", "1080p" …) → Fallback ohne Jahr
-      4. Residual-Garbage bereinigen
+      2. Jahr in Klammern (YYYY) → primärer Schnitt-Anker (höchste Priorität)
+         Beispiel: "Wonder.Woman.1984.(2020)" → Titel="Wonder Woman 1984", Jahr=2020
+      3. Jahr ohne Klammern (1900–2099) → Fallback-Anker
+      4. Tech-Anker ("german", "1080p" …) → Fallback ohne Jahr
+      5. Residual-Garbage bereinigen
     """
     stem = os.path.splitext(filename)[0]
     normalized = stem.replace(".", " ").replace("_", " ")
@@ -435,16 +437,22 @@ def parse_scene_filename(filename: str) -> tuple[str, str | None]:
     # Marker 1: Release-Group
     normalized = re.sub(r"\s+-\s*[A-Za-z0-9]{2,20}$", "", normalized).strip()
 
-    # Marker 2: Jahr
-    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", normalized)
-    year = year_match.group(1) if year_match else None
-
-    if year_match:
-        raw_title = normalized[: year_match.start()]
+    # Marker 2: Jahr in Klammern → definitiver Anker (höchste Priorität)
+    # Erkennt Fälle wie "Wonder Woman 1984 (2020)" korrekt.
+    paren_year_match = re.search(r"\((19\d{2}|20\d{2})\)", normalized)
+    if paren_year_match:
+        year = paren_year_match.group(1)
+        raw_title = normalized[: paren_year_match.start()]
     else:
-        # Marker 3: Tech-Anker
-        tech_match = TECH_ANCHORS.search(normalized)
-        raw_title = normalized[: tech_match.start()] if tech_match else normalized
+        # Marker 3: Jahr ohne Klammern
+        year_match = re.search(r"\b(19\d{2}|20\d{2})\b", normalized)
+        year = year_match.group(1) if year_match else None
+        if year_match:
+            raw_title = normalized[: year_match.start()]
+        else:
+            # Marker 4: Tech-Anker
+            tech_match = TECH_ANCHORS.search(normalized)
+            raw_title = normalized[: tech_match.start()] if tech_match else normalized
 
     # Marker 4: Bereinigung
     raw_title = SCENE_GARBAGE.sub(" ", raw_title)
@@ -853,6 +861,21 @@ _CODEC_DISPLAY: dict[str, str] = {
 }
 
 
+def _get_file_duration_sec(filepath: str) -> float | None:
+    """Schnelle ffprobe-Abfrage: nur Laufzeit in Sekunden (ohne Stream-Details)."""
+    if not _FFPROBE_PATH:
+        return None
+    try:
+        out = subprocess.check_output(
+            [_FFPROBE_PATH, "-v", "quiet", "-print_format", "json", "-show_format", filepath],
+            stderr=subprocess.DEVNULL, timeout=10,
+        )
+        dur = float(json.loads(out).get("format", {}).get("duration") or 0)
+        return dur if dur > 0 else None
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError, OSError):
+        return None
+
+
 def get_file_info(filepath: str) -> dict:
     """
     Liest Video-/Audio-/Untertitel-Eigenschaften via ffprobe.
@@ -1001,14 +1024,16 @@ def _print_file_card(idx: int, rel: str, info: dict, indent: str = "  ", green: 
         print(f"{indent}     Subs:   {' · '.join(sub_langs)}")
 
 
-def find_duplicates(directory: str, cache: dict) -> None:
+def find_duplicates(directory: str, cache: dict) -> bool:
     """
     Sucht Duplikate in Unterverzeichnissen, zeigt Datei-Eigenschaften (ffprobe)
     und bietet interaktiven Dialog. Ausgewählte Duplikate werden in
     <directory>/trash/<timestamp>/ verschoben (mit manifest.json).
+    Gibt True zurück wenn der Cache verändert wurde (c<N> genutzt).
     """
     from collections import defaultdict
 
+    cache_modified = False
     trash_base = os.path.join(directory, "trash")
 
     # Videodateien sammeln – trash/-Unterordner ausschließen
@@ -1020,7 +1045,7 @@ def find_duplicates(directory: str, cache: dict) -> None:
 
     if not video_items:
         print("Keine Videodateien gefunden.")
-        return
+        return False
 
     print(f"Analysiere {len(video_items)} Videodateien in: {directory}")
     print("─" * 80)
@@ -1057,7 +1082,7 @@ def find_duplicates(directory: str, cache: dict) -> None:
 
     if not all_groups:
         print("✓ Keine Duplikate gefunden.")
-        return
+        return False
 
     if not _FFPROBE_PATH:
         print("⚠ ffprobe nicht gefunden — Datei-Eigenschaften nicht verfügbar.")
@@ -1065,7 +1090,7 @@ def find_duplicates(directory: str, cache: dict) -> None:
 
     n_groups = len(all_groups)
     print(f"\n{n_groups} Duplikat-Gruppe(n) gefunden.")
-    print("Befehle: Nummer(n)  |  b = alle markieren  |  s = überspringen  |  q = weiter zur Zusammenfassung\n")
+    print("Befehle: Nummer(n)  |  c<N> = Cache löschen (falsche Erkennung)  |  b = alle markieren  |  s = überspringen  |  q = weiter zur Zusammenfassung\n")
 
     to_trash: list[dict] = []
     quit_interactive = False
@@ -1100,6 +1125,20 @@ def find_duplicates(directory: str, cache: dict) -> None:
 
         # Sind alle Dateien inhaltlich identisch (gleiche Größe + Dauer)?
         identical = _files_identical([fc["info"] for fc in file_cards])
+
+        # ── Laufzeit-Sanity für TMDB-Gruppen: falsche ID-Erkennung herausfiltern ────
+        if g_type == "tmdb" and _FFPROBE_PATH:
+            durs  = [fc["info"].get("duration") for fc in file_cards]
+            valid = [d for d in durs if d and d > 0]
+            if len(valid) >= 2 and max(valid) - min(valid) > 300:  # > 5 Minuten
+                diff_min = round((max(valid) - min(valid)) / 60)
+                print(f"  ⚠ Laufzeit-Abweichung {diff_min} min — wahrscheinlich falsche TMDB-Erkennung, übersprungen.")
+                for fc in file_cards:
+                    dur_s = fc["info"].get("duration") or 0
+                    print(f"     {fc['rel']}  ({dur_s / 60:.0f} min)")
+                print(f"  Tipp: Datei mit falscher TMDB-ID im Live-Modus neu scrapen.\n")
+                continue
+
         # Vorauswahl: bei identischen Dateien alle außer der ersten markieren (2..N)
         default_idxs: list[int] = list(range(1, len(file_cards))) if identical else []
 
@@ -1110,9 +1149,9 @@ def find_duplicates(directory: str, cache: dict) -> None:
         # ── Eingabe ───────────────────────────────────────────────────────────
         if default_idxs:
             default_str = ",".join(str(i + 1) for i in default_idxs)
-            _prompt = f"  Markieren [1\u2013{len(items)}/b/s/q, Enter={default_str}]: "
+            _prompt = f"  Markieren [1\u2013{len(items)}/b/s/q/c<N>, Enter={default_str}]: "
         else:
-            _prompt = f"  Markieren [1\u2013{len(items)}/b/s/q]: "
+            _prompt = f"  Markieren [1\u2013{len(items)}/b/s/q/c<N>]: "
 
         chosen_idxs: list[int] = []
         while True:
@@ -1137,6 +1176,22 @@ def find_duplicates(directory: str, cache: dict) -> None:
             if raw in ("b", "beide", "all", "alle"):
                 chosen_idxs = list(range(len(items)))
                 break
+
+            # c<N> = Cache-Eintrag löschen (falsche Erkennung korrigieren)
+            cache_clear_m = re.match(r"^c(\d+)$", raw)
+            if cache_clear_m:
+                ci = int(cache_clear_m.group(1)) - 1
+                if 0 <= ci < len(file_cards):
+                    fn_to_clear = file_cards[ci]["fn"]
+                    if fn_to_clear in cache:
+                        del cache[fn_to_clear]
+                        cache_modified = True
+                        print(f"  ✓ Cache für [{ci + 1}] ({fn_to_clear}) gelöscht → wird beim nächsten Lauf neu erkannt.")
+                    else:
+                        print(f"  [{ci + 1}] hat keinen Cache-Eintrag.")
+                else:
+                    print(f"  Ungültig: erwartet c1–c{len(file_cards)}.")
+                continue
 
             # Zahlen parsen: "1", "2", "1 2", "1,2"
             tokens = re.split(r"[\s,]+", raw)
@@ -1172,7 +1227,7 @@ def find_duplicates(directory: str, cache: dict) -> None:
 
     if not to_trash:
         print("Nichts markiert — fertig.")
-        return
+        return cache_modified
 
     total_bytes = sum(e["info"].get("size", 0) for e in to_trash)
     freed_str   = (
@@ -1193,7 +1248,7 @@ def find_duplicates(directory: str, cache: dict) -> None:
         return
     if confirm not in ("j", "ja", "y", "yes"):
         print("Abgebrochen — keine Dateien verschoben.")
-        return
+        return cache_modified
 
     # ── In trash/<timestamp>/ verschieben ─────────────────────────────────────
     ts        = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M")
@@ -1241,6 +1296,8 @@ def find_duplicates(directory: str, cache: dict) -> None:
         script = os.path.basename(sys.argv[0])
         print(f"\nUndo (Dry-Run):   python3 {script} {directory} --undo {manifest_path}")
         print(f"Undo (ausf\u00fchren): python3 {script} {directory} --undo {manifest_path} --execute")
+
+    return cache_modified
 
 
 # ─── Undo ─────────────────────────────────────────────────────────────────────
@@ -1548,7 +1605,8 @@ def main() -> None:
             print(f"Duplikat-Suche (standalone, Cache: {len(cache)} Einträge)")
         else:
             print("Duplikat-Suche (standalone, kein Cache — nur Dateiname+Jahr heuristisch)")
-        find_duplicates(directory, cache)
+        if find_duplicates(directory, cache):
+            cache_save(cache_path, cache)
         return
 
     if not api_key:
@@ -1731,14 +1789,69 @@ def main() -> None:
             if parsed_year:
                 result_year = (result.get("release_date") or "")[:4]
                 if result_year and abs(int(result_year) - int(parsed_year)) > 1:
-                    failed.append((
-                        subdir,
-                        filename,
-                        f"Jahreskonflikt: Dateiname={parsed_year}, TMDB={result_year} "
-                        f"({result.get('original_title', '')})",
-                    ))
-                    errors += 1
-                    continue
+                    # Jahreskonflikt: nochmals explizit mit Datei-Jahr suchen
+                    # (TMDB gibt ggf. populäreres Remake/Original zurück)
+                    try:
+                        year_results = tmdb_search_raw(
+                            parsed_title, parsed_year, api_key, limit=5, locale=locale
+                        )
+                        time.sleep(args.delay)
+                        alt_result = next(
+                            (r for r in year_results
+                             if (r.get("release_date") or "")[:4] == parsed_year),
+                            None,
+                        )
+                    except RuntimeError:
+                        alt_result = None
+                    if alt_result:
+                        result = alt_result
+                    else:
+                        failed.append((
+                            subdir,
+                            filename,
+                            f"Jahreskonflikt: Dateiname={parsed_year}, TMDB={result_year} "
+                            f"({result.get('original_title', '')})",
+                        ))
+                        errors += 1
+                        continue
+
+            # ── Laufzeit-Sanity-Check (greift nur wenn kein Jahr im Dateinamen) ─────────
+            # Wenn keine Jahresangabe im Dateinamen → mehr Mehrdeutigkeit → TMDB-Laufzeit
+            # gegen Datei-Dauer prüfen; bei Abweichung >15 min besseren Kandidaten suchen.
+            if not parsed_year and _FFPROBE_PATH:
+                file_dur = _get_file_duration_sec(filepath)
+                if file_dur and file_dur > 600:  # > 10 Min (kein Trailer)
+                    try:
+                        movie_data   = tmdb_get(f"/movie/{result.get('id')}", {}, api_key)
+                        time.sleep(args.delay)
+                        tmdb_runtime = movie_data.get("runtime") or 0
+                        if tmdb_runtime > 0:
+                            file_min = file_dur / 60.0
+                            cur_diff = abs(file_min - tmdb_runtime)
+                            if cur_diff > 15:
+                                # Breitere Suche — Kandidaten nach Laufzeit-Nähe bewerten
+                                alt_results = tmdb_search_raw(
+                                    parsed_title, None, api_key, limit=5, locale=locale
+                                )
+                                time.sleep(args.delay)
+                                best_result, best_diff = result, cur_diff
+                                for alt in alt_results:
+                                    alt_id = alt.get("id")
+                                    if not alt_id or alt_id == result.get("id"):
+                                        continue
+                                    try:
+                                        alt_data = tmdb_get(f"/movie/{alt_id}", {}, api_key)
+                                        time.sleep(args.delay)
+                                        alt_rt = alt_data.get("runtime") or 0
+                                        if alt_rt > 0 and abs(file_min - alt_rt) < best_diff:
+                                            best_diff   = abs(file_min - alt_rt)
+                                            best_result = alt
+                                    except RuntimeError:
+                                        continue
+                                if best_result is not result and best_diff < cur_diff - 5:
+                                    result = best_result
+                    except RuntimeError:
+                        pass
 
             chosen             = choose_title(result, api_key, keep_original_langs, locale=locale)
             release_date       = result.get("release_date", "")
@@ -1934,7 +2047,8 @@ def main() -> None:
     print("═" * 80)
     print(f"DUPLIKATSUCHE  ({dup_dir})")
     print("─" * 80)
-    find_duplicates(dup_dir, cache)
+    if find_duplicates(dup_dir, cache):
+        cache_save(cache_path, cache)
 
 
 if __name__ == "__main__":
