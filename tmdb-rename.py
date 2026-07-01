@@ -1848,9 +1848,13 @@ def main() -> None:
             # Mit ffprobe: 1 API-Call (runtime), bei Abweichung>15min Alternativen suchen,
             #   → auto-korrigieren oder bei echter Mehrdeutigkeit Live-Modus.
             # Ohne ffprobe: einfacher Ambiguity-Check per API-Suche → Live-Modus.
+            _res_title = result.get("original_title") or result.get("title", "")
+            _title_ok  = titles_similar(parsed_title, _res_title)
+
             if _FFPROBE_PATH:
                 file_dur = _get_file_duration_sec(filepath)
-                if file_dur and file_dur > 600:
+                # Titel passt bereits klar → kein Runtime-API-Call nötig
+                if file_dur and file_dur > 600 and not _title_ok:
                     try:
                         movie_data   = tmdb_get(f"/movie/{result.get('id')}", {}, api_key)
                         time.sleep(args.delay)
@@ -1892,8 +1896,8 @@ def main() -> None:
                                     continue
                     except RuntimeError:
                         pass
-            elif parsed_year:
-                # Kein ffprobe → einfacher Ambiguity-Check
+            elif parsed_year and not _title_ok:
+                # Kein ffprobe → einfacher Ambiguity-Check (nur wenn Titel unklar)
                 try:
                     amb_results = tmdb_search_raw(
                         parsed_title, parsed_year, api_key, limit=3, locale=locale
