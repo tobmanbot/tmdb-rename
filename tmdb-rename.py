@@ -692,8 +692,16 @@ def live_mode(
         else:
             file_dest_dir_lm = subdir_lm
         parsed_title, parsed_year = parse_scene_filename(filename)
+        _lm_filepath = os.path.join(subdir_lm, filename)
+        _lm_dur_min: float | None = None
+        if _FFPROBE_PATH:
+            _dur = _get_file_duration_sec(_lm_filepath)
+            if _dur and _dur > 0:
+                _lm_dur_min = _dur / 60.0
 
         print(f"Datei:   {filename}")
+        if _lm_dur_min:
+            print(f"Länge:   {_lm_dur_min:.0f} min")
         print(f"Geparst: '{parsed_title}'  Jahr: {parsed_year or '—'}")
         print(f"Grund:   {reason}")
 
@@ -738,14 +746,36 @@ def live_mode(
                 print("  Keine Treffer.")
                 continue
 
-            # Ergebnisse anzeigen
+            # Ergebnisse anzeigen — Laufzeiten via TMDB holen und besten Match markieren
+            runtimes: list[int | None] = []
+            if _lm_dur_min and api_key:
+                for r in results:
+                    try:
+                        md = tmdb_get(f"/movie/{r['id']}", {}, api_key)
+                        runtimes.append(md.get("runtime") or None)
+                        time.sleep(0.25)
+                    except RuntimeError:
+                        runtimes.append(None)
+            else:
+                runtimes = [None] * len(results)
+
+            best_idx: int | None = None
+            if _lm_dur_min and any(rt for rt in runtimes if rt):
+                diffs = [(abs(_lm_dur_min - rt), i) for i, rt in enumerate(runtimes) if rt]
+                if diffs:
+                    best_idx = min(diffs)[1]
+
             print()
-            for i, r in enumerate(results, 1):
+            for i, (r, rt) in enumerate(zip(results, runtimes), 1):
                 rd   = r.get("release_date", "")[:4] or "????"
                 orig = r.get("original_title", "")
                 loc  = r.get("title", "")
                 extra = f" / {loc}" if loc != orig else ""
-                print(f"  [{i}] {orig}{extra} ({rd})")
+                rt_str = f"  {rt} min" if rt else ""
+                is_best = (i - 1 == best_idx and rt is not None)
+                hint = "  ← Laufzeit passt" if is_best else ""
+                line = f"  [{i}] {orig}{extra} ({rd}){rt_str}{hint}"
+                print(f"\033[32m{line}\033[0m" if is_best else line)
             print("  [0] Erneut suchen")
             print("  [s] Überspringen (korrekt benannt)")
             print("  [i] Ignorieren (unbekannt)")
