@@ -1556,8 +1556,8 @@ def main() -> None:
     parser.add_argument(
         "--delay",
         type=float,
-        default=0.3,
-        help="Pause zwischen API-Anfragen in Sekunden (Standard: 0.3)",
+        default=0.25,
+        help="Pause zwischen API-Anfragen in Sekunden (Standard: 0.25)",
     )
     parser.add_argument(
         "--force-ffprobe",
@@ -1844,10 +1844,56 @@ def main() -> None:
                 errors += 1
                 continue
 
-            # ── Mehrdeutigkeits-Check: mehrere Treffer im gleichen Jahr → Live-Modus ──
-            # Wenn parsed_year gesetzt und TMDB-Suche liefert 2+ Treffer im selben Jahr
-            # → nicht auto-selektieren, sondern User im Live-Modus wählen lassen.
-            if parsed_year:
+            # ── Kombinierter Laufzeit- + Mehrdeutigkeits-Check ─────────────────────────
+            # Mit ffprobe: 1 API-Call (runtime), bei Abweichung>15min Alternativen suchen,
+            #   → auto-korrigieren oder bei echter Mehrdeutigkeit Live-Modus.
+            # Ohne ffprobe: einfacher Ambiguity-Check per API-Suche → Live-Modus.
+            if _FFPROBE_PATH:
+                file_dur = _get_file_duration_sec(filepath)
+                if file_dur and file_dur > 600:
+                    try:
+                        movie_data   = tmdb_get(f"/movie/{result.get('id')}", {}, api_key)
+                        time.sleep(args.delay)
+                        tmdb_runtime = movie_data.get("runtime") or 0
+                        if tmdb_runtime > 0:
+                            file_min = file_dur / 60.0
+                            cur_diff = abs(file_min - tmdb_runtime)
+                            if cur_diff > 15:
+                                # Kandidaten nach Laufzeit-Nähe bewerten
+                                # parsed_year als Filter nutzen (präziser als year=None)
+                                alt_results = tmdb_search_raw(
+                                    parsed_title, parsed_year, api_key, limit=5, locale=locale
+                                )
+                                time.sleep(args.delay)
+                                best_result, best_diff = result, cur_diff
+                                for alt in alt_results:
+                                    alt_id = alt.get("id")
+                                    if not alt_id or alt_id == result.get("id"):
+                                        continue
+                                    try:
+                                        alt_data = tmdb_get(f"/movie/{alt_id}", {}, api_key)
+                                        time.sleep(args.delay)
+                                        alt_rt = alt_data.get("runtime") or 0
+                                        if alt_rt > 0 and abs(file_min - alt_rt) < best_diff:
+                                            best_diff   = abs(file_min - alt_rt)
+                                            best_result = alt
+                                    except RuntimeError:
+                                        continue
+                                if best_result is not result and best_diff < cur_diff - 5:
+                                    result = best_result  # auto-korrigiert
+                                elif cur_diff > 15:
+                                    # Kein besserer Kandidat → Live-Modus
+                                    failed.append((
+                                        subdir, filename,
+                                        f"mehrdeutig/Laufzeit: Datei {file_min:.0f} min, "
+                                        f"TMDB '{result.get('original_title','')}' {tmdb_runtime} min",
+                                    ))
+                                    errors += 1
+                                    continue
+                    except RuntimeError:
+                        pass
+            elif parsed_year:
+                # Kein ffprobe → einfacher Ambiguity-Check
                 try:
                     amb_results = tmdb_search_raw(
                         parsed_title, parsed_year, api_key, limit=3, locale=locale
@@ -1899,44 +1945,6 @@ def main() -> None:
                         ))
                         errors += 1
                         continue
-
-            # ── Laufzeit-Sanity-Check (greift nur wenn kein Jahr im Dateinamen) ─────────
-            # Wenn keine Jahresangabe im Dateinamen → mehr Mehrdeutigkeit → TMDB-Laufzeit
-            # gegen Datei-Dauer prüfen; bei Abweichung >15 min besseren Kandidaten suchen.
-            if _FFPROBE_PATH:
-                file_dur = _get_file_duration_sec(filepath)
-                if file_dur and file_dur > 600:  # > 10 Min (kein Trailer)
-                    try:
-                        movie_data   = tmdb_get(f"/movie/{result.get('id')}", {}, api_key)
-                        time.sleep(args.delay)
-                        tmdb_runtime = movie_data.get("runtime") or 0
-                        if tmdb_runtime > 0:
-                            file_min = file_dur / 60.0
-                            cur_diff = abs(file_min - tmdb_runtime)
-                            if cur_diff > 15:
-                                # Breitere Suche — Kandidaten nach Laufzeit-Nähe bewerten
-                                alt_results = tmdb_search_raw(
-                                    parsed_title, None, api_key, limit=5, locale=locale
-                                )
-                                time.sleep(args.delay)
-                                best_result, best_diff = result, cur_diff
-                                for alt in alt_results:
-                                    alt_id = alt.get("id")
-                                    if not alt_id or alt_id == result.get("id"):
-                                        continue
-                                    try:
-                                        alt_data = tmdb_get(f"/movie/{alt_id}", {}, api_key)
-                                        time.sleep(args.delay)
-                                        alt_rt = alt_data.get("runtime") or 0
-                                        if alt_rt > 0 and abs(file_min - alt_rt) < best_diff:
-                                            best_diff   = abs(file_min - alt_rt)
-                                            best_result = alt
-                                    except RuntimeError:
-                                        continue
-                                if best_result is not result and best_diff < cur_diff - 5:
-                                    result = best_result
-                    except RuntimeError:
-                        pass
 
             chosen             = choose_title(result, api_key, keep_original_langs, locale=locale)
             release_date       = result.get("release_date", "")
