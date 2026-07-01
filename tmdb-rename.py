@@ -1127,16 +1127,45 @@ def find_duplicates(directory: str, cache: dict) -> bool:
         identical = _files_identical([fc["info"] for fc in file_cards])
 
         # ── Laufzeit-Sanity für TMDB-Gruppen: falsche ID-Erkennung herausfiltern ────
+        duration_mismatch = False
         if g_type == "tmdb" and _FFPROBE_PATH:
             durs  = [fc["info"].get("duration") for fc in file_cards]
             valid = [d for d in durs if d and d > 0]
             if len(valid) >= 2 and max(valid) - min(valid) > 300:  # > 5 Minuten
+                duration_mismatch = True
                 diff_min = round((max(valid) - min(valid)) / 60)
-                print(f"  ⚠ Laufzeit-Abweichung {diff_min} min — wahrscheinlich falsche TMDB-Erkennung, übersprungen.")
+                print(f"  ⚠ Laufzeit-Abweichung {diff_min} min — wahrscheinlich falsche TMDB-Erkennung.")
                 for fc in file_cards:
                     dur_s = fc["info"].get("duration") or 0
-                    print(f"     {fc['rel']}  ({dur_s / 60:.0f} min)")
-                print(f"  Tipp: Datei mit falscher TMDB-ID im Live-Modus neu scrapen.\n")
+                    print(f"     [{file_cards.index(fc) + 1}] {fc['rel']}  ({dur_s / 60:.0f} min)")
+                print(f"  Tipp: Datei mit falscher TMDB-ID im Live-Modus neu scrapen.")
+                print(f"  c<N> = Cache-Eintrag löschen  |  s = überspringen  |  q = weiter zur Zusammenfassung\n")
+                while True:
+                    try:
+                        raw = input("  Aktion [c<N>/s/q]: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        raw = "q"
+                    if raw in ("s", ""):
+                        print("  übersprungen.\n")
+                        break
+                    if raw == "q":
+                        quit_interactive = True
+                        break
+                    cache_clear_m = re.match(r"^c(\d+)$", raw)
+                    if cache_clear_m:
+                        ci = int(cache_clear_m.group(1)) - 1
+                        if 0 <= ci < len(file_cards):
+                            fn_to_clear = file_cards[ci]["fn"]
+                            if fn_to_clear in cache:
+                                del cache[fn_to_clear]
+                                cache_modified = True
+                                print(f"  ✓ Cache für [{ci + 1}] ({fn_to_clear}) gelöscht → wird beim nächsten Lauf neu erkannt.")
+                            else:
+                                print(f"  ⚠ [{ci + 1}] hat keinen Cache-Eintrag.")
+                        else:
+                            print(f"  ⚠ Ungültige Nummer.")
+                    else:
+                        print("  Ungültige Eingabe.")
                 continue
 
         # Vorauswahl: bei identischen Dateien alle außer der ersten markieren (2..N)
