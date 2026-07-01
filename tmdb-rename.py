@@ -1903,7 +1903,7 @@ def main() -> None:
             # ── Laufzeit-Sanity-Check (greift nur wenn kein Jahr im Dateinamen) ─────────
             # Wenn keine Jahresangabe im Dateinamen → mehr Mehrdeutigkeit → TMDB-Laufzeit
             # gegen Datei-Dauer prüfen; bei Abweichung >15 min besseren Kandidaten suchen.
-            if not parsed_year and _FFPROBE_PATH:
+            if _FFPROBE_PATH:
                 file_dur = _get_file_duration_sec(filepath)
                 if file_dur and file_dur > 600:  # > 10 Min (kein Trailer)
                     try:
