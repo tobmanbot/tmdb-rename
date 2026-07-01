@@ -1862,7 +1862,7 @@ def main() -> None:
                         if tmdb_runtime > 0:
                             file_min = file_dur / 60.0
                             cur_diff = abs(file_min - tmdb_runtime)
-                            if cur_diff > 15:
+                            if cur_diff > 5:
                                 # Kandidaten nach Laufzeit-Nähe bewerten
                                 # parsed_year als Filter nutzen (präziser als year=None)
                                 alt_results = tmdb_search_raw(
@@ -1883,9 +1883,9 @@ def main() -> None:
                                             best_result = alt
                                     except RuntimeError:
                                         continue
-                                if best_result is not result and best_diff < cur_diff - 5:
+                                if best_result is not result and best_diff < cur_diff - 3:
                                     result = best_result  # auto-korrigiert
-                                elif cur_diff > 15:
+                                elif cur_diff > 5:
                                     # Kein besserer Kandidat → Live-Modus
                                     failed.append((
                                         subdir, filename,
