@@ -1814,6 +1814,32 @@ def main() -> None:
                 errors += 1
                 continue
 
+            # ── Mehrdeutigkeits-Check: mehrere Treffer im gleichen Jahr → Live-Modus ──
+            # Wenn parsed_year gesetzt und TMDB-Suche liefert 2+ Treffer im selben Jahr
+            # → nicht auto-selektieren, sondern User im Live-Modus wählen lassen.
+            if parsed_year:
+                try:
+                    amb_results = tmdb_search_raw(
+                        parsed_title, parsed_year, api_key, limit=3, locale=locale
+                    )
+                    time.sleep(args.delay)
+                    amb_same_year = [
+                        r for r in amb_results
+                        if (r.get("release_date") or "")[:4] == parsed_year
+                        and r.get("id") != result.get("id")
+                    ]
+                    if amb_same_year:
+                        alt_orig = amb_same_year[0].get("original_title", "?")
+                        failed.append((
+                            subdir, filename,
+                            f"mehrdeutig: '{result.get('original_title', '?')}' vs. "
+                            f"'{alt_orig}' (beide {parsed_year}) — manuelle Auswahl nötig",
+                        ))
+                        errors += 1
+                        continue
+                except RuntimeError:
+                    pass
+
             # Jahres-Sanity-Check: Dateiname hat explizites Jahr → TMDB-Ergebnis muss passen
             if parsed_year:
                 result_year = (result.get("release_date") or "")[:4]
